@@ -75,7 +75,9 @@ task.spawn(function()
 	task.wait(8)
 	while alive and env.BridgeFetchVersion do
 		local ok, latest = pcall(env.BridgeFetchVersion)
-		if ok and latest ~= "" and mine and latest ~= mine then
+		-- reload once per new version: if the loader still hands back the old one (stale cache) it tells you instead of looping
+		if ok and latest ~= "" and mine and latest ~= mine and env.BridgeTried ~= latest then
+			env.BridgeTried = latest
 			win:Notify("New version " .. latest .. " found - reloading", 4)
 			task.wait(1.5)
 			local reload = env.BridgeReload
