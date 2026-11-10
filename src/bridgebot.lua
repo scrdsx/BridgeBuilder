@@ -135,7 +135,10 @@ local function plan(rules, card, budget)
 				local placed = #mem - refused
 				if deckOK and d:getSpent() <= cap then
 					-- beams the budget refused are dropped, so prefer designs that lose nothing
-					local score = placed * (1 + 0.2 * h) - refused * 3 - d:getSpent() / 4000
+					-- a truss is strong when it is about span/6 deep and its diagonals are ~55 degrees (step about 1.4 x depth); spend the budget, lose nothing
+					local W = info.R - info.L
+					local hWant = math.clamp(W / 6, 2, 4)
+					local score = -math.abs(h - hWant) * 4 - math.abs(info.step / h - 1.4) * 3 - refused * 5 + d:getSpent() / math.max(cap, 1) * 2
 					if not best or score > bestScore then best, bestScore = { mem = mem, info = info, p = p, h = h, refused = refused }, score end
 				elseif not deckOK and (not failPlaced or placed > failPlaced) then
 					failWhy, failPlaced = why, placed
