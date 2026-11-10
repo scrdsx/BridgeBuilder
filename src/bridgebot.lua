@@ -125,21 +125,25 @@ end
 
 local function plan(rules, card, budget)
 	local cap = math.floor(budget * (Bot.SpendPct / 100))
-	local best, bestScore, firstWhy
+	if budget >= 100000 then cap = math.min(cap, 60000) end -- unlimited rounds: do not waste time on a silly spend
+	local best, bestScore, failWhy, failPlaced
 	for _, p in ipairs({ 4, 3.5, 3, 2.5, 2, 1.5 }) do
 		for _, h in ipairs({ 1, 2, 3, 4 }) do
 			local mem, info = genMembers(card, p, h)
 			if mem then
 				local d, refused, deckOK, why = realize(rules, mem)
-				firstWhy = firstWhy or why
-				if refused == 0 and deckOK and d:getSpent() <= cap then
-					local score = #mem * (1 + 0.2 * h) - d:getSpent() / 4000
-					if not best or score > bestScore then best, bestScore = { mem = mem, info = info, p = p, h = h }, score end
+				local placed = #mem - refused
+				if deckOK and d:getSpent() <= cap then
+					-- beams the budget refused are dropped, so prefer designs that lose nothing
+					local score = placed * (1 + 0.2 * h) - refused * 3 - d:getSpent() / 4000
+					if not best or score > bestScore then best, bestScore = { mem = mem, info = info, p = p, h = h, refused = refused }, score end
+				elseif not deckOK and (not failPlaced or placed > failPlaced) then
+					failWhy, failPlaced = why, placed
 				end
 			end
 		end
 	end
-	if not best then return nil, firstWhy end
+	if not best then return nil, failWhy end
 	-- spend what is left on steel where it matters (steel reach is short, so only short members)
 	if Bot.Upgrade and rules.allowed.steel then
 		local d0 = realize(rules, best.mem)
@@ -162,10 +166,10 @@ local function plan(rules, card, budget)
 			end
 		end
 	end
-	local d, refused, deckOK, why = realize(rules, best.mem)
-	if refused > 0 or not deckOK or d:getSpent() > budget then
+	local d, refused, deckOK = realize(rules, best.mem)
+	if not deckOK or d:getSpent() > budget or refused > best.refused then
 		for _, b in ipairs(best.mem) do b.mat = nil end -- the upgrade did not fit: plain version
-		d, refused, deckOK, why = realize(rules, best.mem)
+		d = realize(rules, best.mem)
 	end
 	return d, best
 end
@@ -189,6 +193,26 @@ end
 
 local reply
 local replyConn
+local wrapped = {}
+local function hookClass()
+	local ok, cls = pcall(function() return require(ClientFolder:WaitForChild("BuildController", 10)) end)
+	if not ok or type(cls) ~= "table" then log("BuildController class not found: " .. tostring(cls)); return end
+	for _, name in ipairs({ "onFrame", "refreshCards", "refreshAim", "refreshSnap", "scheduleSend", "onResponse", "refreshReady" }) do
+		local orig = rawget(cls, name)
+		if type(orig) == "function" then
+			wrapped[#wrapped + 1] = { cls = cls, name = name, orig = orig }
+			cls[name] = function(self, ...)
+				if rawget(self, "design") ~= nil then ctrl = self end
+				return orig(self, ...)
+			end
+		end
+	end
+	log("hooked " .. #wrapped .. " controller methods")
+end
+local function unhookClass()
+	for _, w in ipairs(wrapped) do pcall(function() w.cls[w.name] = w.orig end) end
+	wrapped = {}
+end
 
 local function deliver(list, spent)
 	reply = nil
@@ -296,8 +320,9 @@ function Bot.Start()
 			Bot.BuildNow()
 		end
 	end)
+	pcall(hookClass)
 	task.spawn(function() -- find the game's controller early so the first build already shows
-		for _ = 1, 20 do if findController() then Bot.Hooked = true; break end task.wait(1.5) end
+		for _ = 1, 20 do if findController() then Bot.Hooked = true; break end task.wait(0.5) end
 		log("game controller:", Bot.Hooked and "found (bridge will be drawn)" or "not found (the bridge is sent, the preview may not show)")
 		changed()
 	end)
@@ -309,6 +334,7 @@ function Bot.Start()
 end
 
 function Bot.Destroy()
+	unhookClass()
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	conns = {}
 	Bot.Auto = false
