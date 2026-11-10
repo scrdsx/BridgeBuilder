@@ -102,6 +102,49 @@ local function genMembers(card, p, h)
 	return mem, { L = L, R = R, top = top, n = n, step = step, h = h }
 end
 
+
+-- Winner's design from the recorded data: deck of road, road posts hanging down at the deck nodes, and a CABLE chain through the post bottoms and the
+-- lower cliff anchors (cable is tension-only and far stronger than wood). Extra crossing cables stiffen it when the budget allows.
+local function genCable(card, s, h)
+	local m = card.map
+	local cl = m.cliffs or { left = m.zone.minX, right = m.zone.maxX, top = m.deckY or 0 }
+	local L, R, top = cl.left, cl.right, cl.top
+	local W = R - L
+	if W <= 0 then return nil end
+	local n = math.max(2, math.ceil(W / s - 1e-6))
+	local step = W / n
+	if step > BuildConfig.reach.road then return nil end
+	local xs = {}
+	for i = 0, n do xs[i + 1] = L + i * step end
+	local bot = top - h
+	local mem = {}
+	for i = 1, n do mem[#mem + 1] = { xs[i], top, xs[i + 1], top, role = "deck", base = "road" } end
+	for i = 2, n do mem[#mem + 1] = { xs[i], top, xs[i], bot, role = "post", base = "road" } end
+	-- lowest anchor on each side (the cable ends); the deck end node if there is none below the deck
+	local la, ra
+	for _, an in ipairs(m.anchors or {}) do
+		if an[2] < top - 0.01 then
+			if an[1] <= L + 0.01 then if not la or an[2] < la[2] then la = an end
+			elseif an[1] >= R - 0.01 then if not ra or an[2] < ra[2] then ra = an end end
+		end
+	end
+	la = la or { L, top }
+	ra = ra or { R, top }
+	mem[#mem + 1] = { la[1], la[2], xs[2], bot, role = "chord", base = "cable" }
+	for i = 2, n - 1 do mem[#mem + 1] = { xs[i], bot, xs[i + 1], bot, role = "chord", base = "cable" } end
+	mem[#mem + 1] = { ra[1], ra[2], xs[n], bot, role = "chord", base = "cable" }
+	-- crossing cables, centre first (they only start from points that already exist)
+	local order = {}
+	for i = 2, n - 1 do order[#order + 1] = i end
+	local mid = (n + 2) / 2
+	table.sort(order, function(a, b) return math.abs(a - mid) < math.abs(b - mid) end)
+	for _, i in ipairs(order) do
+		mem[#mem + 1] = { xs[i], top, xs[i + 1], bot, role = "xdiag", base = "cable" }
+		mem[#mem + 1] = { xs[i + 1], top, xs[i], bot, role = "xdiag", base = "cable" }
+	end
+	return mem, { L = L, R = R, top = top, n = n, step = step, h = h, family = "cable" }
+end
+
 local function baseMaterial(rules)
 	if rules.allowed.wood then return "wood" end
 	if rules.allowed.steel then return "steel" end
@@ -116,7 +159,7 @@ local function realize(rules, mem)
 	local base = baseMaterial(rules)
 	local refused, deckOK, why, placed = 0, true, {}, {}
 	for _, b in ipairs(mem) do
-		local mat = b.mat or Bot.over[sigOf(b)] or (b.role == "deck" and "road") or base
+		local mat = b.mat or Bot.over[sigOf(b)] or b.base or (b.role == "deck" and "road") or base
 		if b.role == "deck" then mat = "road" end
 		local ok, r = d:place(snap(b[1]), snap(b[2]), snap(b[3]), snap(b[4]), mat)
 		if not ok then
@@ -135,33 +178,49 @@ local function plan(rules, card, budget)
 	if budget >= 100000 then cap = math.min(cap, 60000) end -- unlimited rounds: do not waste time on a silly spend
 	local best, bestScore, failWhy, failPlaced
 	local panels, depths = { 4, 3.5, 3, 2.5, 2, 1.5 }, { 1, 2, 3, 4 }
+	local cpanels, cdepths = { 4, 3.5, 3, 2.5, 2 }, { 2, 2.5, 3, 3.5, 4, 5 }
 	if Bot.Custom then
-		if Bot.ForcePanel > 0 then panels = { Bot.ForcePanel } end
-		if Bot.ForceDepth > 0 then depths = { Bot.ForceDepth } end
+		if Bot.ForcePanel > 0 then panels, cpanels = { Bot.ForcePanel }, { Bot.ForcePanel } end
+		if Bot.ForceDepth > 0 then depths, cdepths = { Bot.ForceDepth }, { Bot.ForceDepth } end
 	end
-	if Bot.geom and Bot.geomKey == Bot.roundKey then panels, depths = { Bot.geom.p }, { Bot.geom.h } end -- tuning: keep the geometry so the learned beams still match
-	for _, p in ipairs(panels) do
-		for _, h in ipairs(depths) do
-			local mem, info = genMembers(card, p, h)
-			if mem then
-				local d, refused, deckOK, why = realize(rules, mem)
-				local placed = #mem - refused
-				if deckOK and d:getSpent() <= cap then
-					-- beams the budget refused are dropped, so prefer designs that lose nothing
-					-- a truss is strong when it is about span/6 deep and its diagonals are ~55 degrees (step about 1.4 x depth); spend the budget, lose nothing
-					local W = info.R - info.L
-					local hWant = math.clamp(W / 6, 2, 4)
-					local score = -math.abs(h - hWant) * 4 - math.abs(info.step / h - 1.4) * 3 - refused * 5 + d:getSpent() / math.max(cap, 1) * 2
-					if not best or score > bestScore then best, bestScore = { mem = mem, info = info, p = p, h = h, refused = refused }, score end
-				elseif not deckOK and (not failPlaced or placed > failPlaced) then
-					failWhy, failPlaced = why, placed
+	local families = { "cable", "warren" }
+	if not rules.allowed.cable then families = { "warren" } end
+	if Bot.geom and Bot.geomKey == Bot.roundKey then -- tuning: keep the geometry so the learned beams still match
+		panels, depths, cpanels, cdepths = { Bot.geom.p }, { Bot.geom.h }, { Bot.geom.p }, { Bot.geom.h }
+		families = { Bot.geom.family }
+	end
+	for _, fam in ipairs(families) do
+		local ps, hs = panels, depths
+		if fam == "cable" then ps, hs = cpanels, cdepths end
+		for _, p in ipairs(ps) do
+			for _, h in ipairs(hs) do
+				local mem, info
+				if fam == "cable" then mem, info = genCable(card, p, h) else mem, info = genMembers(card, p, h) end
+				if mem then
+					local d, refused, deckOK, why = realize(rules, mem)
+					local placed = #mem - refused
+					if deckOK and d:getSpent() <= cap then
+						local W = info.R - info.L
+						local score
+						if fam == "cable" then
+							-- recorded winner: posts about span/5 deep, panels about 3 cells; spend the budget, lose nothing
+							local hWant = math.clamp(W / 5, 2, 4)
+							score = 6 - math.abs(h - hWant) * 3 - math.abs(info.step - 3) * 2 - refused * 0.4 + d:getSpent() / math.max(cap, 1) * 4
+						else
+							local hWant = math.clamp(W / 6, 2, 4)
+							score = -math.abs(h - hWant) * 4 - math.abs(info.step / h - 1.4) * 3 - refused * 5 + d:getSpent() / math.max(cap, 1) * 2
+						end
+						if not best or score > bestScore then best, bestScore = { mem = mem, info = info, p = p, h = h, refused = refused, family = fam }, score end
+					elseif not deckOK and (not failPlaced or placed > failPlaced) then
+						failWhy, failPlaced = why, placed
+					end
 				end
 			end
 		end
 	end
 	if not best then return nil, failWhy end
 	-- spend what is left on steel where it matters (steel reach is short, so only short members)
-	if Bot.Upgrade and rules.allowed.steel and next(Bot.over) == nil then
+	if Bot.Upgrade and rules.allowed.steel and next(Bot.over) == nil and best.family ~= "cable" then
 		local d0 = realize(rules, best.mem)
 		local remaining = cap - d0:getSpent()
 		local info = best.info
@@ -306,11 +365,11 @@ function Bot.BuildNow()
 		end
 		local list = d:toList()
 		Bot.last = { placed = best.placed, list = list, budget = budget, cap = math.floor(budget * (Bot.SpendPct / 100)), best = best, rules = rules, card = card }
-		Bot.geom, Bot.geomKey = { p = best.p, h = best.h }, Bot.roundKey
+		Bot.geom, Bot.geomKey = { p = best.p, h = best.h, family = best.family }, Bot.roundKey
 		Bot.Spent, Bot.Beams = d:getSpent(), #list
 		local counts = {}
 		for _, b in ipairs(list) do counts[b[5]] = (counts[b[5]] or 0) + 1 end
-		Bot.Shape = ("%d panels, depth %d"):format(best.info.n, best.h)
+		Bot.Shape = ("%s: %d panels, depth %s"):format(best.family, best.info.n, tostring(best.h))
 		log(("layout=%s twist=%s budget=%d materials=%s | %s | beams=%d spent=%d | road %d wood %d steel %d cable %d"):format(
 			Bot.Layout, Bot.Twist, budget, table.concat(card.materials, ","), Bot.Shape, #list, Bot.Spent,
 			counts.road or 0, counts.wood or 0, counts.steel or 0, counts.cable or 0))
