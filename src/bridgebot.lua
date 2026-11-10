@@ -12,6 +12,7 @@ local Bot = {
 	Info = "starting", Last = "nothing built yet", Phase = "-", Layout = "-", Twist = "-", Budget = 0, Spent = 0, Beams = 0, Shape = "-",
 	Busy = false, LogLines = {}, Changed = nil, Hooked = false,
 	Custom = false, ForceDepth = 0, ForcePanel = 0,
+	over = {}, Tuning = false, Version = "?",
 }
 
 local function log(...)
@@ -108,20 +109,25 @@ local function baseMaterial(rules)
 	return "road"
 end
 
+local function sigOf(b) return ("%.2f,%.2f,%.2f,%.2f"):format(b[1], b[2], b[3], b[4]) end
+
 local function realize(rules, mem)
 	local d = LocalDesign.new(rules)
 	local base = baseMaterial(rules)
-	local refused, deckOK, why = 0, true, {}
+	local refused, deckOK, why, placed = 0, true, {}, {}
 	for _, b in ipairs(mem) do
-		local mat = b.mat or (b.role == "deck" and "road") or base
+		local mat = b.mat or Bot.over[sigOf(b)] or (b.role == "deck" and "road") or base
+		if b.role == "deck" then mat = "road" end
 		local ok, r = d:place(snap(b[1]), snap(b[2]), snap(b[3]), snap(b[4]), mat)
 		if not ok then
 			refused = refused + 1
 			why[tostring(r)] = (why[tostring(r)] or 0) + 1
 			if b.role == "deck" then deckOK = false end
+		else
+			placed[#placed + 1] = b
 		end
 	end
-	return d, refused, deckOK, why
+	return d, refused, deckOK, why, placed
 end
 
 local function plan(rules, card, budget)
@@ -133,6 +139,7 @@ local function plan(rules, card, budget)
 		if Bot.ForcePanel > 0 then panels = { Bot.ForcePanel } end
 		if Bot.ForceDepth > 0 then depths = { Bot.ForceDepth } end
 	end
+	if Bot.geom and Bot.geomKey == Bot.roundKey then panels, depths = { Bot.geom.p }, { Bot.geom.h } end -- tuning: keep the geometry so the learned beams still match
 	for _, p in ipairs(panels) do
 		for _, h in ipairs(depths) do
 			local mem, info = genMembers(card, p, h)
@@ -154,7 +161,7 @@ local function plan(rules, card, budget)
 	end
 	if not best then return nil, failWhy end
 	-- spend what is left on steel where it matters (steel reach is short, so only short members)
-	if Bot.Upgrade and rules.allowed.steel then
+	if Bot.Upgrade and rules.allowed.steel and next(Bot.over) == nil then
 		local d0 = realize(rules, best.mem)
 		local remaining = cap - d0:getSpent()
 		local info = best.info
@@ -175,11 +182,12 @@ local function plan(rules, card, budget)
 			end
 		end
 	end
-	local d, refused, deckOK = realize(rules, best.mem)
+	local d, refused, deckOK, _, placed = realize(rules, best.mem)
 	if not deckOK or d:getSpent() > budget or refused > best.refused then
 		for _, b in ipairs(best.mem) do b.mat = nil end -- the upgrade did not fit: plain version
-		d = realize(rules, best.mem)
+		d, _, _, _, placed = realize(rules, best.mem)
 	end
+	best.placed = placed
 	return d, best
 end
 
@@ -245,12 +253,11 @@ local wrapped = {}
 local function hookClass()
 	local ok, cls = pcall(function() return require(ClientFolder:WaitForChild("BuildController", 10)) end)
 	if not ok or type(cls) ~= "table" then log("BuildController class not found: " .. tostring(cls)); return end
-	for _, name in ipairs({ "onFrame", "refreshCards", "refreshAim", "refreshSnap", "scheduleSend", "onResponse", "refreshReady" }) do
-		local orig = rawget(cls, name)
-		if type(orig) == "function" then
+	for name, orig in pairs(cls) do
+		if type(orig) == "function" and name ~= "new" and name ~= "destroy" then
 			wrapped[#wrapped + 1] = { cls = cls, name = name, orig = orig }
 			cls[name] = function(self, ...)
-				if rawget(self, "design") ~= nil then ctrl = self end
+				if ctrl == nil and type(self) == "table" and rawget(self, "design") ~= nil and rawget(self, "renderer") ~= nil then ctrl = self end
 				return orig(self, ...)
 			end
 		end
@@ -287,6 +294,8 @@ function Bot.BuildNow()
 		if Bot.Phase ~= "Build" then Bot.Last = "wait for the build phase (now: " .. Bot.Phase .. ")"; log(Bot.Last); return end
 		if type(lp:GetAttribute("Lane")) ~= "number" then Bot.Last = "you have no lane yet"; log(Bot.Last); return end
 		Bot.Layout, Bot.Twist, Bot.Budget = tostring(card.layout), tostring(card.twist), budget
+		local rk = tostring(RoundState:GetAttribute("BuildFrom"))
+		if rk ~= Bot.roundKey then Bot.roundKey = rk; Bot.over = {}; Bot.geom = nil end
 		local d, best = plan(rules, card, budget)
 		if not d then
 			local w = {}
@@ -296,6 +305,8 @@ function Bot.BuildNow()
 			return
 		end
 		local list = d:toList()
+		Bot.last = { placed = best.placed, list = list, budget = budget, cap = math.floor(budget * (Bot.SpendPct / 100)), best = best, rules = rules, card = card }
+		Bot.geom, Bot.geomKey = { p = best.p, h = best.h }, Bot.roundKey
 		Bot.Spent, Bot.Beams = d:getSpent(), #list
 		local counts = {}
 		for _, b in ipairs(list) do counts[b[5]] = (counts[b[5]] or 0) + 1 end
@@ -340,6 +351,172 @@ function Bot.CopyLog()
 	return #Bot.LogLines
 end
 
+-- observer: reads the same public data the game shows everyone (test events + my own test-drive frames) ------------------
+local TP
+local Obs = { peak = {}, brokenIdx = {}, started = false, ended = false, setup = nil, outs = {} }
+local HttpService = game:GetService("HttpService")
+
+local function memMaterial(m, rules)
+	if m.role == "deck" then return "road" end
+	return m.mat or Bot.over[sigOf(m)] or baseMaterial(rules)
+end
+
+local function appendDataset(row)
+	pcall(function()
+		if not (writefile and makefolder) then return end
+		pcall(makefolder, "BridgeData")
+		local path = "BridgeData/rounds.jsonl"
+		local old = ""
+		if isfile and isfile(path) then old = readfile(path) end
+		writefile(path, old .. HttpService:JSONEncode(row) .. "\n")
+	end)
+end
+
+local function laneBeams(lane)
+	local pts, out = lane.points or {}, {}
+	local zero = false
+	for _, b in ipairs(lane.beams or {}) do if b.a == 0 or b.b == 0 then zero = true break end end
+	local add = zero and 1 or 0
+	for _, b in ipairs(lane.beams or {}) do
+		local ia, ib = b.a + add, b.b + add
+		local ax, ay, bx, by = pts[2 * ia - 1], pts[2 * ia], pts[2 * ib - 1], pts[2 * ib]
+		if ax and bx then out[#out + 1] = { ax, ay, bx, by, b.material, b.broken and 1 or 0 } end
+	end
+	return out
+end
+
+local function saveResults(ev)
+	local setup = Obs.setup
+	if not setup then return end
+	local byLane = {}
+	for _, l in ipairs(setup.lanes or {}) do byLane[l.lane] = l end
+	local row = { t = os.time(), version = Bot.Version, layout = tostring(RoundState:GetAttribute("Layout")), twist = tostring(RoundState:GetAttribute("Twist")),
+		budget = RoundState:GetAttribute("Budget"), waves = setup.waves, winner = ev.winner, rule = ev.rule, lanes = {} }
+	local mine
+	for _, r in ipairs(ev.ranking or {}) do
+		local l = byLane[r.lane]
+		local entry = { lane = r.lane, name = r.name, rank = r.rank, outWave = r.outWave, progress = r.progress, cost = r.cost, rings = r.rings, isGhost = r.isGhost }
+		if l then
+			entry.beams = laneBeams(l)
+			local c = {}
+			for _, b in ipairs(l.beams or {}) do c[b.material or "?"] = (c[b.material or "?"] or 0) + 1 end
+			entry.mats = c
+			entry.broken = Obs.brokenLane and Obs.brokenLane[r.lane] or 0
+			if l.userId == lp.UserId then mine = entry end
+		end
+		row.lanes[#row.lanes + 1] = entry
+	end
+	appendDataset(row)
+	local win
+	for _, e in ipairs(row.lanes) do if e.lane == ev.winner then win = e end end
+	local function mats(e) local t = {} for k, n in pairs(e.mats or {}) do t[#t + 1] = k .. " " .. n end table.sort(t) return table.concat(t, ", ") end
+	if mine then
+		Bot.LastRound = ("rank %s, out wave %s, cost %s"):format(tostring(mine.rank), tostring(mine.outWave or "survived all"), tostring(mine.cost))
+		log("ROUND RESULT: you: " .. Bot.LastRound .. " | " .. mats(mine))
+	end
+	if win then log(("ROUND RESULT: winner %s cost %s | %s | rule=%s"):format(tostring(win.name), tostring(win.cost), mats(win), tostring(ev.rule))) end
+	changed()
+end
+
+local function onTestEvents(buf)
+	local evs = TP and TP.decodeEvents(buf)
+	if not evs then return end
+	for _, ev in ipairs(evs) do
+		local t = ev.type
+		if t == "setup" then Obs.setup, Obs.outs, Obs.brokenLane = ev, {}, {}
+		elseif t == "beamBroke" then Obs.brokenLane = Obs.brokenLane or {}; Obs.brokenLane[ev.lane] = (Obs.brokenLane[ev.lane] or 0) + 1
+		elseif t == "laneOut" then Obs.outs[ev.lane] = { wave = ev.wave, reason = ev.reason, progress = ev.progress }
+		elseif t == "results" then pcall(saveResults, ev) end
+	end
+end
+
+local function summarizeDrive()
+	local L = Bot.last
+	if not L then return end
+	local per = {}
+	for k, m in ipairs(L.placed) do
+		local mat = memMaterial(m, L.rules)
+		local e = per[mat] or { n = 0, max = 0, sum = 0, broke = 0 }
+		per[mat] = e
+		local pk = Obs.peak[k] or 0
+		e.n = e.n + 1; e.sum = e.sum + pk; e.max = math.max(e.max, pk)
+		if Obs.brokenIdx[k] then e.broke = e.broke + 1 end
+	end
+	local parts = {}
+	for mat, e in pairs(per) do parts[#parts + 1] = ("%s n=%d max=%.2f avg=%.2f broke=%d"):format(mat, e.n, e.max, e.sum / math.max(e.n, 1), e.broke) end
+	table.sort(parts)
+	log("DRIVE STRESS: " .. table.concat(parts, " | "))
+end
+
+local function applyLearning()
+	local L = Bot.last
+	if not L then return false end
+	local reach = BuildConfig.reach.steel
+	local diff = BuildConfig.prices.steel - BuildConfig.prices.wood
+	local hot, cold = {}, {}
+	for k, m in ipairs(L.placed) do
+		if m.role ~= "deck" then
+			local pk, brk = Obs.peak[k] or 0, Obs.brokenIdx[k]
+			local dx, dy = m[3] - m[1], m[4] - m[2]
+			local cur = memMaterial(m, L.rules)
+			if (brk or pk >= 0.8) and cur == "wood" and dx * dx + dy * dy <= reach * reach and L.rules.allowed.steel then
+				hot[#hot + 1] = { sig = sigOf(m), pk = pk + (brk and 1 or 0), cost = math.round(diff * studs(dx, dy)) }
+			elseif pk < 0.3 and cur == "steel" then
+				cold[#cold + 1] = { sig = sigOf(m), pk = pk, cost = math.round(diff * studs(dx, dy)) }
+			end
+		end
+	end
+	table.sort(hot, function(a, b) return a.pk > b.pk end)
+	table.sort(cold, function(a, b) return a.pk < b.pk end)
+	local free = L.cap - Bot.Spent
+	local up, down = 0, 0
+	for _, h in ipairs(hot) do
+		while h.cost > free and #cold > 0 do
+			local c = table.remove(cold, 1)
+			Bot.over[c.sig] = "wood"; free = free + c.cost; down = down + 1
+		end
+		if h.cost <= free then Bot.over[h.sig] = "steel"; free = free - h.cost; up = up + 1 end
+	end
+	log(("LEARNED: %d wood->steel, %d steel->wood (hot %d)"):format(up, down, #hot))
+	return up + down > 0
+end
+
+function Bot.RunTestDrive(timeout)
+	local TD = Remotes and Remotes:FindFirstChild("TestDrive")
+	if not TD then return false end
+	Obs.started, Obs.ended, Obs.peak, Obs.brokenIdx = false, false, {}, {}
+	TD:FireServer("start")
+	local t0 = os.clock()
+	while not Obs.started and os.clock() - t0 < 6 do task.wait(0.1) end
+	if not Obs.started then log("test drive did not start (no charges left or too late in the round)"); return false end
+	t0 = os.clock()
+	while not Obs.ended and os.clock() - t0 < (timeout or 45) do task.wait(0.2) end
+	summarizeDrive()
+	return Obs.ended
+end
+
+function Bot.AutoTune(rounds)
+	if Bot.Tuning then return end
+	Bot.Tuning = true
+	changed()
+	local ok, err = pcall(function()
+		Bot.BuildNow()
+		for i = 1, (rounds or 2) do
+			if RoundState:GetAttribute("Phase") ~= "Build" then break end
+			Bot.Info = ("tuning %d: test drive"):format(i); changed()
+			if not Bot.RunTestDrive() then break end
+			if not applyLearning() then log("nothing to change - this bridge looks balanced"); break end
+			task.wait(0.5)
+			Bot.Info = ("tuning %d: rebuild"):format(i); changed()
+			Bot.BuildNow()
+		end
+	end)
+	Bot.Tuning = false
+	Bot.Info = "ready"
+	if not ok then log("auto-tune error: " .. tostring(err)) end
+	changed()
+end
+
 -- start / stop ------------------------------------------------------------------------------------------------------
 local conns = {}
 local lastRound
@@ -349,13 +526,37 @@ function Bot.Start()
 	if not ok then Bot.Info = "load failed: " .. tostring(err); log(Bot.Info); changed(); return false end
 	replyConn = Design.OnClientEvent:Connect(function(r) reply = r end)
 	conns[#conns + 1] = replyConn
+	pcall(function() TP = require(Shared:WaitForChild("TestProtocol")) end)
 	pcall(function()
 		local TD = Remotes:WaitForChild("TestDrive", 5)
-		if TD then conns[#conns + 1] = TD.OnClientEvent:Connect(function(...)
-			local t = {}
-			for i = 1, select("#", ...) do local v = select(i, ...); t[i] = type(v) == "table" and "{table}" or tostring(v) end
-			log("testdrive:", table.concat(t, ", "))
+		if TD then conns[#conns + 1] = TD.OnClientEvent:Connect(function(kind, id, a, b)
+			if kind == "start" then Obs.started = true
+			elseif kind == "end" then Obs.ended = true
+			elseif kind == "events" then
+				local evs = TP and type(a) == "buffer" and TP.decodeEvents(a)
+				for _, ev in ipairs(evs or {}) do
+					if ev.type == "beamBroke" then Obs.brokenIdx[ev.beam] = true; log("drive: beam " .. tostring(ev.beam) .. " broke")
+					elseif ev.type == "waveStart" or ev.type == "vehicleFell" or ev.type == "vehicleArrived" or ev.type == "vehicleStuck" or ev.type == "laneOut" or ev.type == "waveSurvived" then
+						log("drive: " .. ev.type .. (ev.kind and (" " .. tostring(ev.kind)) or "") .. (ev.reason and (" " .. tostring(ev.reason)) or ""))
+					end
+				end
+			end
 		end) end
+		local TDF = Remotes:WaitForChild("TestDriveFrame", 5)
+		if TDF then conns[#conns + 1] = TDF.OnClientEvent:Connect(function(id, buf)
+			local f = TP and type(buf) == "buffer" and TP.decodeFrame(buf)
+			if not f then return end
+			for _, sec in ipairs(f.sections or {}) do
+				for k, v in ipairs(sec.stress or {}) do
+					local idx = (sec.beamStart or 1) + k - 1
+					local ratio, brk = TP.stressRatio(v)
+					if ratio > (Obs.peak[idx] or 0) then Obs.peak[idx] = ratio end
+					if brk then Obs.brokenIdx[idx] = true end
+				end
+			end
+		end) end
+		local TE = Remotes:WaitForChild("TestEvent", 5)
+		if TE then conns[#conns + 1] = TE.OnClientEvent:Connect(onTestEvents) end
 	end)
 	conns[#conns + 1] = RoundState:GetAttributeChangedSignal("Phase"):Connect(function()
 		Bot.Phase = tostring(RoundState:GetAttribute("Phase"))
@@ -376,7 +577,8 @@ function Bot.Start()
 	end)
 	Bot.Info = "ready"
 	Bot.Phase = tostring(RoundState:GetAttribute("Phase"))
-	log("loaded. phase=" .. Bot.Phase .. " layout=" .. tostring(RoundState:GetAttribute("Layout")) .. " twist=" .. tostring(RoundState:GetAttribute("Twist")))
+	Bot.Version = tostring(env.BridgeVersion or "?")
+	log("loaded v" .. Bot.Version .. ". phase=" .. Bot.Phase .. " layout=" .. tostring(RoundState:GetAttribute("Layout")) .. " twist=" .. tostring(RoundState:GetAttribute("Twist")))
 	changed()
 	return true
 end
