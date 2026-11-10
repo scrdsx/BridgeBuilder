@@ -36,6 +36,10 @@ mAuto:Toggle({ Name = "Press Ready after a good build", Default = false, Callbac
 mAuto:Toggle({ Name = "Spend the leftover on steel", Default = true, Callback = function(v) Bot.Upgrade = v end })
 mAuto:Slider({ Name = "Spend at most", Min = 20, Max = 100, Step = 5, Default = 100, Suffix = " % of the budget", Callback = function(v) Bot.SpendPct = v end })
 
+local mShape = tB:Module({ Name = "Custom shape", Default = false, Callback = function(on) Bot.Custom = on; win:Notify(on and "Custom shape on (0 = let the planner choose)" or "Custom shape off") end })
+mShape:Slider({ Name = "Truss depth (cells)", Min = 0, Max = 5, Step = 0.5, Default = 0, Callback = function(v) Bot.ForceDepth = v end })
+mShape:Slider({ Name = "Panel width (cells)", Min = 0, Max = 4, Step = 0.5, Default = 0, Callback = function(v) Bot.ForcePanel = v end })
+
 -- Info ---------------------------------------------------------------------------------------------------------------
 local tI = win:Tab("Info", { Section = "Bridge", Icon = 3 })
 tI:Label({ Name = "Prices per stud", Value = "road 200, wood 100, steel 250, cable 150" })
@@ -50,6 +54,7 @@ end })
 local tS = win:Tab("Settings", { Section = "Script", Icon = 9 })
 tS:Slider({ Name = "UI scale", Min = 0.7, Max = 1.4, Step = 0.05, Default = 1, Callback = function(v) win:SetScale(v) end })
 tS:Label({ Name = "Toggle UI", Value = "RightShift" })
+tS:Label({ Name = "Version", Value = tostring(env.BridgeVersion or "?") })
 local function unload()
 	alive = false
 	Bot.Changed = nil
@@ -59,6 +64,24 @@ local function unload()
 end
 tS:Button({ Name = "Unload", Callback = unload })
 env.__BridgeBuilder = unload
+
+-- auto reload when a new version is pushed
+task.spawn(function()
+	local mine = env.BridgeVersion
+	task.wait(8)
+	while alive and env.BridgeFetchVersion do
+		local ok, latest = pcall(env.BridgeFetchVersion)
+		if ok and latest ~= "" and mine and latest ~= mine then
+			win:Notify("New version " .. latest .. " found - reloading", 4)
+			task.wait(1.5)
+			local reload = env.BridgeReload
+			unload()
+			if reload then task.spawn(reload) end
+			return
+		end
+		task.wait(45)
+	end
+end)
 
 table.insert(win.conns, UIS.InputBegan:Connect(function(i)
 	if i.KeyCode == Enum.KeyCode.RightShift then win:Toggle() end

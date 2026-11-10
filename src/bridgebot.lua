@@ -11,6 +11,7 @@ local Bot = {
 	Auto = false, AutoReady = false, Upgrade = true, SpendPct = 100,
 	Info = "starting", Last = "nothing built yet", Phase = "-", Layout = "-", Twist = "-", Budget = 0, Spent = 0, Beams = 0, Shape = "-",
 	Busy = false, LogLines = {}, Changed = nil, Hooked = false,
+	Custom = false, ForceDepth = 0, ForcePanel = 0,
 }
 
 local function log(...)
@@ -127,8 +128,13 @@ local function plan(rules, card, budget)
 	local cap = math.floor(budget * (Bot.SpendPct / 100))
 	if budget >= 100000 then cap = math.min(cap, 60000) end -- unlimited rounds: do not waste time on a silly spend
 	local best, bestScore, failWhy, failPlaced
-	for _, p in ipairs({ 4, 3.5, 3, 2.5, 2, 1.5 }) do
-		for _, h in ipairs({ 1, 2, 3, 4 }) do
+	local panels, depths = { 4, 3.5, 3, 2.5, 2, 1.5 }, { 1, 2, 3, 4 }
+	if Bot.Custom then
+		if Bot.ForcePanel > 0 then panels = { Bot.ForcePanel } end
+		if Bot.ForceDepth > 0 then depths = { Bot.ForceDepth } end
+	end
+	for _, p in ipairs(panels) do
+		for _, h in ipairs(depths) do
 			local mem, info = genMembers(card, p, h)
 			if mem then
 				local d, refused, deckOK, why = realize(rules, mem)
@@ -182,6 +188,45 @@ local ctrl
 local function findController()
 	if ctrl and rawget(ctrl, "design") ~= nil then return ctrl end
 	ctrl = nil
+	local function isCtrl(t)
+		if type(t) ~= "table" then return false end
+		local ok, hit = pcall(function()
+			return rawget(t, "design") ~= nil and rawget(t, "renderer") ~= nil and rawget(t, "roundState") ~= nil and rawget(t, "remote") ~= nil
+		end)
+		return ok and hit
+	end
+	local getups = (debug and debug.getupvalues) or getupvalues
+	local function fromFunction(f, depth)
+		if type(f) ~= "function" or not getups then return nil end
+		local ok, ups = pcall(getups, f)
+		if not ok or type(ups) ~= "table" then return nil end
+		for _, v in pairs(ups) do
+			if isCtrl(v) then return v end
+		end
+		if depth < 2 then
+			for _, v in pairs(ups) do
+				if type(v) == "function" then local r = fromFunction(v, depth + 1); if r then return r end end
+			end
+		end
+		return nil
+	end
+	if getconnections then
+		local signals = { Design and Design.OnClientEvent, lp:GetAttributeChangedSignal("Lane"), RoundState and RoundState:GetAttributeChangedSignal("Phase"),
+			RoundState and RoundState:GetAttributeChangedSignal("Budget"), RoundState and RoundState:GetAttributeChangedSignal("EndsAt") }
+		local ready = Remotes and Remotes:FindFirstChild("Ready")
+		if ready then signals[#signals + 1] = ready.OnClientEvent end
+		for _, sig in ipairs(signals) do
+			local ok, conns = pcall(getconnections, sig)
+			if ok and type(conns) == "table" then
+				for _, c in ipairs(conns) do
+					local f
+					pcall(function() f = c.Function end)
+					local r = fromFunction(f, 0)
+					if r then ctrl = r; return r end
+				end
+			end
+		end
+	end
 	if not getgc then return nil end
 	for _, t in ipairs(getgc(true)) do
 		if type(t) == "table" then
