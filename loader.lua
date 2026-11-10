@@ -15,23 +15,10 @@ do
 	local o, r = BASE:match("raw%.githubusercontent%.com/([^/]+)/([^/]+)/")
 	if o then POLL_BASE = ("https://raw.githubusercontent.com/%s/%s/main/"):format(o, r) end
 end
+-- No commit pinning here: the GitHub API answer is cached for a minute and rate limited, so a pinned load could report an OLDER version
+-- than the branch and the auto-reload would loop. Every file below is fetched with a cache-busting ?t=, so the branch is always fresh.
 local commit
-if not LOCAL then
-	local owner, repo, branch = BASE:match("raw%.githubusercontent%.com/([^/]+)/([^/]+)/([^/]+)/")
-	if owner then
-		local ok, body = pcall(function()
-			return game:HttpGet(("https://api.github.com/repos/%s/%s/commits/%s"):format(owner, repo, branch))
-		end)
-		if ok then
-			local okj, data = pcall(function() return game:GetService("HttpService"):JSONDecode(body) end)
-			if okj and type(data) == "table" and type(data.sha) == "string" then
-				commit = data.sha
-				BASE = ("https://raw.githubusercontent.com/%s/%s/%s/"):format(owner, repo, commit)
-			end
-		end
-	end
-end
-env.BridgeCommit = commit and commit:sub(1, 7) or "unpinned"
+env.BridgeCommit = "main"
 
 local sources, cache = {}, {}
 
