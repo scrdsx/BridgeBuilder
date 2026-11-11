@@ -2,6 +2,7 @@
 -- It uses the game's OWN modules (Shared.BuildConfig / DesignRules / LocalDesign / Maps, Client.RoundRules) so every beam is checked by the game's
 -- rules before it is sent, and it pushes the design through the game's own BuildController so you SEE it and the budget bar updates.
 -- Design format (same as the game): Remotes.Design:FireServer({ beams = { {x1, y1, x2, y2, material}, ... } }), coordinates in cells (1/8 cell grid).
+local Truss = __import("truss")
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local lp = Players.LocalPlayer
@@ -250,6 +251,277 @@ local function plan(rules, card, budget)
 	return d, best
 end
 
+-- SOLVER PLANNER ---------------------------------------------------------------------------------------------------------
+-- Several truss topologies x panel widths x depths. Each is analysed with a real truss solver (src/truss.lua), then the budget is spent on the
+-- most stressed beams (a stronger material where its reach allows) while over-built beams are made cheaper. Capacities come from the recorded rounds.
+local CAP = { wood = { t = 1.0, c = 1.0 }, steel = { t = 3.0, c = 2.5 }, cable = { t = 0.5, c = 0 }, road = { t = 4.0, c = 5.0 } }
+Bot.Cap = CAP
+
+local function pkey(x, y) return ("%d,%d"):format(math.floor(x * 8 + 0.5), math.floor(y * 8 + 0.5)) end
+
+local function trussOpts(card, top)
+	local set = {}
+	for _, an in ipairs(card.map.anchors or {}) do set[pkey(an[1], an[2])] = true end
+	return {
+		supports = function(x, y) return set[pkey(x, y)] == true end,
+		loadAt = function(x, y) return math.abs(y - top) < 0.01 end,
+	}
+end
+
+local function memLen(b) return math.sqrt((b[3] - b[1]) ^ 2 + (b[4] - b[2]) ^ 2) end
+local function costOf(mat, lenCells) return math.round(BuildConfig.prices[mat] * BuildConfig.cellSize * lenCells) end
+local function reachOK(mat, lenCells) local r = BuildConfig.reach[mat]; return r ~= nil and lenCells <= r + 1e-6 end
+
+local function frame(card, s)
+	local m = card.map
+	local cl = m.cliffs or { left = m.zone.minX, right = m.zone.maxX, top = m.deckY or 0 }
+	local L, R, top = cl.left, cl.right, cl.top
+	local W = R - L
+	if W <= 0 then return nil end
+	local n = math.max(2, math.ceil(W / s - 1e-6))
+	local step = W / n
+	if step > BuildConfig.reach.road then return nil end
+	local xs = {}
+	for i = 0, n do xs[i + 1] = L + i * step end
+	local la, ra
+	for _, an in ipairs(m.anchors or {}) do
+		if an[2] < top - 0.01 then
+			if an[1] <= L + 0.01 then if not la or an[2] < la[2] then la = an end
+			elseif an[1] >= R - 0.01 then if not ra or an[2] < ra[2] then ra = an end end
+		end
+	end
+	return { L = L, R = R, top = top, n = n, step = step, xs = xs, la = la, ra = ra }
+end
+
+local function newMem()
+	local mem, seen = {}, {}
+	local function add(x1, y1, x2, y2, role)
+		local a, b = pkey(x1, y1), pkey(x2, y2)
+		local k = a < b and (a .. "|" .. b) or (b .. "|" .. a)
+		if seen[k] or a == b then return end
+		seen[k] = true
+		mem[#mem + 1] = { x1, y1, x2, y2, role = role }
+	end
+	return mem, add
+end
+
+-- Pratt (as the round winner "Wren" built): posts under the deck nodes, bottom chord from anchor to anchor, diagonals leaning to the centre
+local function genPratt(card, s, h)
+	local f = frame(card, s)
+	if not f or not f.la or not f.ra then return nil end
+	local n, xs, top = f.n, f.xs, f.top
+	local bot = top - h
+	local mem, add = newMem()
+	for i = 1, n do add(xs[i], top, xs[i + 1], top, "deck") end
+	for i = 2, n do add(xs[i], top, xs[i], bot, "post") end
+	local B = {}
+	B[1] = { f.la[1], f.la[2] }
+	for i = 2, n do B[i] = { xs[i], bot } end
+	B[n + 1] = { f.ra[1], f.ra[2] }
+	for i = 1, n do add(B[i][1], B[i][2], B[i + 1][1], B[i + 1][2], "chord") end
+	for i = 1, n + 1 do
+		if i <= n / 2 + 0.01 and i <= n then add(B[i][1], B[i][2], xs[i + 1], top, "diag")
+		elseif i > n / 2 + 1 then add(B[i][1], B[i][2], xs[i - 1], top, "diag") end
+	end
+	return mem, { L = f.L, R = f.R, top = top, n = n, step = f.step, h = h }
+end
+
+-- posts with a W of diagonals (the other winner shape): every post bottom reaches both neighbouring deck nodes
+local function genPostW(card, s, h, chord)
+	local f = frame(card, s)
+	if not f then return nil end
+	local n, xs, top = f.n, f.xs, f.top
+	local bot = top - h
+	local mem, add = newMem()
+	for i = 1, n do add(xs[i], top, xs[i + 1], top, "deck") end
+	for i = 2, n do add(xs[i], top, xs[i], bot, "post") end
+	for i = 2, n do
+		add(xs[i], bot, xs[i - 1], top, "diag")
+		add(xs[i], bot, xs[i + 1], top, "diag")
+	end
+	if f.la then add(f.la[1], f.la[2], xs[2], bot, "brace") end
+	if f.ra then add(f.ra[1], f.ra[2], xs[n], bot, "brace") end
+	if chord ~= false then for i = 2, n - 1 do add(xs[i], bot, xs[i + 1], bot, "chord") end end
+	return mem, { L = f.L, R = f.R, top = top, n = n, step = f.step, h = h }
+end
+
+local function startMats(rules, mem)
+	local base = baseMaterial(rules)
+	local mats = {}
+	for i, b in ipairs(mem) do
+		if b.role == "deck" then mats[i] = "road"
+		else
+			local m = Bot.over[sigOf(b)] or base
+			if not reachOK(m, memLen(b)) then
+				m = "wood"
+				if not (rules.allowed.wood and reachOK("wood", memLen(b))) then m = rules.allowed.cable and "cable" or "road" end
+			end
+			mats[i] = m
+		end
+	end
+	return mats
+end
+
+local function beamsOf(mem, mats)
+	local out = {}
+	for i, b in ipairs(mem) do out[i] = { b[1], b[2], b[3], b[4], mats[i] } end
+	return out
+end
+
+local function totalCost(mem, mats)
+	local t = 0
+	for i, b in ipairs(mem) do t = t + costOf(mats[i], memLen(b)) end
+	return t
+end
+
+local function evaluate(mem, mats, opts)
+	return Truss.strength(beamsOf(mem, mats), opts, CAP)
+end
+
+-- drop beams that carry nothing (free saving), then, if the design is over the budget, drop the least loaded beams while it stays sound
+local function reduce(mem, mats, opts, cap)
+	local m2, t2, protected = {}, {}, {}
+	for i, b in ipairs(mem) do m2[i] = b; t2[i] = mats[i] end
+	for _ = 1, 60 do
+		local lam, r = evaluate(m2, t2, opts)
+		if not lam then return m2, t2 end
+		local total = totalCost(m2, t2)
+		local victim, vf = nil, math.huge
+		for i, b in ipairs(m2) do
+			if b.role ~= "deck" and not protected[b] then
+				local fi = r.f[i]
+				if fi < 1e-6 then victim, vf = i, -1; break end
+				if total > cap and fi < vf then victim, vf = i, fi end
+			end
+		end
+		if not victim then break end
+		local m3, t3 = {}, {}
+		for i, b in ipairs(m2) do if i ~= victim then m3[#m3 + 1] = b; t3[#t3 + 1] = t2[i] end end
+		local lam2 = evaluate(m3, t3, opts)
+		if lam2 and (vf < 0 or lam2 >= lam * 0.35) then
+			m2, t2 = m3, t3
+		else
+			protected[m2[victim]] = true
+		end
+	end
+	return m2, t2
+end
+
+-- spend the budget where the stress is: upgrade the weakest non-deck beam, pay for it by making over-built beams cheaper
+local function optimise(rules, mem, mats, opts, capBudget)
+	local total = totalCost(mem, mats)
+	for _ = 1, 70 do
+		local lam, r = evaluate(mem, mats, opts)
+		if not lam then break end
+		local beams = beamsOf(mem, mats)
+		-- utilisation of every non-deck beam: capacity / force (smaller = closer to breaking)
+		local util, worst, worstU = {}, nil, math.huge
+		for i, b in ipairs(mem) do
+			if b.role ~= "deck" and r.f[i] > 1e-9 then
+				local c = CAP[mats[i]]
+				local k = r.sign[i] > 0 and c.t or c.c
+				util[i] = k / r.f[i]
+				if util[i] < worstU then worst, worstU = i, util[i] end
+			end
+		end
+		if not worst then break end
+		local b, len, cur, sign = mem[worst], memLen(mem[worst]), mats[worst], r.sign[worst]
+		local curK = sign > 0 and CAP[cur].t or CAP[cur].c
+		local pick, pickK
+		for _, m in ipairs({ "road", "steel", "wood", "cable" }) do
+			if m ~= cur and rules.allowed[m] and reachOK(m, len) and (m ~= "cable" or sign > 0) then
+				local k = sign > 0 and CAP[m].t or CAP[m].c
+				if k > curK * 1.05 and total + costOf(m, len) - costOf(cur, len) <= capBudget then
+					if not pickK or k > pickK then pick, pickK = m, k end
+				end
+			end
+		end
+		if pick then
+			total = total + costOf(pick, len) - costOf(cur, len)
+			mats[worst] = pick
+		else
+			-- no money: find the most over-built beam and make it cheaper while it stays well above the weakest one
+			local freed = false
+			local order = {}
+			for i, u in pairs(util) do order[#order + 1] = { i = i, u = u } end
+			table.sort(order, function(a, c) return a.u > c.u end)
+			for _, o in ipairs(order) do
+				if o.u > worstU * 2.5 then
+					local bi, li, ci = mem[o.i], memLen(mem[o.i]), mats[o.i]
+					local sg = r.sign[o.i]
+					local best, bestSave
+					for _, m in ipairs({ "wood", "road", "cable", "steel" }) do
+						if m ~= ci and rules.allowed[m] and reachOK(m, li) and (m ~= "cable" or sg > 0) then
+							local k = sg > 0 and CAP[m].t or CAP[m].c
+							local save = costOf(ci, li) - costOf(m, li)
+							if save > 0 and k / r.f[o.i] >= worstU * 1.8 and (not bestSave or save > bestSave) then best, bestSave = m, save end
+						end
+					end
+					if best then mats[o.i] = best; total = total - bestSave; freed = true; break end
+				end
+			end
+			if not freed then break end
+		end
+	end
+	return mats, total
+end
+
+local function plan2(rules, card, budget)
+	local cap = math.floor(budget * (Bot.SpendPct / 100))
+	if budget >= 100000 then cap = math.min(cap, 60000) end
+	local f0 = frame(card, 3)
+	if not f0 then return nil end
+	local opts = trussOpts(card, f0.top)
+	local cands = {}
+	local ss, hs = { 4, 3.5, 3, 2.5, 2 }, { 2, 3, 4 }
+	if Bot.Custom then
+		if Bot.ForcePanel > 0 then ss = { Bot.ForcePanel } end
+		if Bot.ForceDepth > 0 then hs = { Bot.ForceDepth } end
+	end
+	local topos = { { "pratt", genPratt }, { "postW", genPostW }, { "fan", function(c, s, h) return genPostW(c, s, h, false) end }, { "warren", function(c, s, h) return genMembers(c, s, h) end } }
+	for _, tp in ipairs(topos) do
+		for _, s in ipairs(ss) do
+			for _, h in ipairs(hs) do
+				local mem, info = tp[2](card, s, h)
+				if mem and #mem > 0 then
+					local mats = startMats(rules, mem)
+					mem, mats = reduce(mem, mats, opts, cap)
+					local spent = totalCost(mem, mats)
+					if spent <= cap then
+						local lam = evaluate(mem, mats, opts)
+						if lam then cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1], s = s, h = h } end
+					end
+				end
+			end
+		end
+	end
+	if #cands == 0 then return nil end
+	table.sort(cands, function(a, b) return a.lam > b.lam end)
+	local top = {}
+	for i = 1, math.min(8, #cands) do
+		local c = cands[i]
+		c.mats, c.cost = optimise(rules, c.mem, c.mats, opts, cap)
+		c.lam2 = evaluate(c.mem, c.mats, opts) or 0
+		top[#top + 1] = c
+	end
+	table.sort(top, function(a, b)
+		if math.abs(a.lam2 - b.lam2) > 1e-6 then return a.lam2 > b.lam2 end
+		return a.cost < b.cost
+	end)
+	-- the game's own rules have the last word: take the strongest design they accept in full
+	for _, c in ipairs(top) do
+		for i, b in ipairs(c.mem) do b.mat = c.mats[i] end
+		local d, refused, deckOK, _, placed = realize(rules, c.mem)
+		if deckOK and refused == 0 and d:getSpent() <= budget then
+			log(("solver: %s s=%s h=%s  strength %.2f -> %.2f  cost %d  (%d candidates)"):format(c.name, tostring(c.s), tostring(c.h), c.lam, c.lam2, d:getSpent(), #cands))
+			Bot.Strength = c.lam2
+			return d, { mem = c.mem, info = c.info, p = c.s, h = c.h, refused = 0, family = c.name, placed = placed }
+		end
+	end
+	log("solver: no candidate was accepted by the game's rules - falling back")
+	return nil
+end
+
 -- the game's own controller (so the bridge is drawn and the budget bar follows) --------------------------------------
 local ctrl
 local function findController()
@@ -355,7 +627,9 @@ function Bot.BuildNow()
 		Bot.Layout, Bot.Twist, Bot.Budget = tostring(card.layout), tostring(card.twist), budget
 		local rk = tostring(RoundState:GetAttribute("BuildFrom"))
 		if rk ~= Bot.roundKey then Bot.roundKey = rk; Bot.over = {}; Bot.geom = nil end
-		local d, best = plan(rules, card, budget)
+		local ok2, d, best = pcall(plan2, rules, card, budget)
+		if not ok2 then log("solver planner error: " .. tostring(d)); d, best = nil, nil end
+		if not d then d, best = plan(rules, card, budget) end
 		if not d then
 			local w = {}
 			for k, n in pairs(best or {}) do w[#w + 1] = k .. " x" .. n end

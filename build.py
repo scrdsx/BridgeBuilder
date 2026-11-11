@@ -2,7 +2,7 @@
 from pathlib import Path
 
 root = Path(__file__).parent
-order = ["logo", "icons", "ui", "bridgebot"]  # dependencies first; main runs last
+order = ["logo", "icons", "ui", "truss", "bridgebot"]  # dependencies first; main runs last
 
 out = ["local __mods, __cache = {}, {}",
        "local function __import(n)",

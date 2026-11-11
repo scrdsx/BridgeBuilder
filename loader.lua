@@ -4,7 +4,7 @@
 local env = getgenv and getgenv() or _G
 local BASE = env.BridgeBase or "https://raw.githubusercontent.com/scrdsx/BridgeBuilder/main/"
 local LOCAL = env.BridgeLocal
-local MODULES = { "logo", "icons", "ui", "bridgebot", "main" } -- main last
+local MODULES = { "logo", "icons", "ui", "truss", "bridgebot", "main" } -- main last
 
 -- raw.githubusercontent.com caches files for ~5 minutes (and some executors cache on top), so a plain
 -- fetch can hand back an old release. Pin to the latest commit SHA instead: those URLs never go stale.
