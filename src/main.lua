@@ -6,6 +6,7 @@ local Bot = __import("bridgebot")
 local TITLE, SUBTITLE = "Bridge Builder", "Last Bridge Standing"
 local env = (getgenv and getgenv()) or _G
 if env.__BridgeBuilder then pcall(env.__BridgeBuilder) end
+if env.BridgeBot and env.BridgeBot.Destroy then pcall(env.BridgeBot.Destroy) end -- the old v0.1 window
 
 local win = UI.new({ Title = TITLE, Subtitle = SUBTITLE })
 local alive = true
@@ -51,7 +52,7 @@ tI:Label({ Name = "Reach (cells)", Value = "road 4, wood 5, steel 3, cable 8" })
 tI:Label({ Name = "Limits", Value = "150 beams, 75 s to build" })
 tI:Button({ Name = "Copy the log (send me this)", Callback = function()
 	local n = Bot.CopyLog()
-	win:Notify(("Copied %d log lines. The file is BridgeScript_log.txt in the workspace"):format(n), 5)
+	win:Notify(("Copied %d log lines. The file is BridgeBuilder_log.txt in the workspace"):format(n), 5)
 end })
 
 -- Settings -----------------------------------------------------------------------------------------------------------

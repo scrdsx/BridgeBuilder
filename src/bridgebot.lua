@@ -22,7 +22,7 @@ local function log(...)
 	local line = os.date("%H:%M:%S") .. "  " .. table.concat(t, " ")
 	Bot.LogLines[#Bot.LogLines + 1] = line
 	if #Bot.LogLines > 500 then table.remove(Bot.LogLines, 1) end
-	pcall(function() if writefile then writefile("BridgeScript_log.txt", table.concat(Bot.LogLines, "\n")) end end)
+	pcall(function() if writefile then writefile("BridgeBuilder_log.txt", table.concat(Bot.LogLines, "\n")) end end)
 end
 Bot.Log = log
 local function changed() if Bot.Changed then task.defer(Bot.Changed) end end
@@ -253,7 +253,7 @@ end
 -- SOLVER PLANNER ---------------------------------------------------------------------------------------------------------
 -- Several truss topologies x panel widths x depths. Each is analysed with a real truss solver (src/truss.lua), then the budget is spent on the
 -- most stressed beams (a stronger material where its reach allows) while over-built beams are made cheaper. Capacities come from the recorded rounds.
-local CAP = { wood = { t = 1.0, c = 1.0 }, steel = { t = 3.0, c = 2.5 }, cable = { t = 0.5, c = 0 }, road = { t = 4.0, c = 5.0 } }
+local CAP = { wood = { t = 1.0, c = 1.0 }, steel = { t = 3.0, c = 2.5 }, cable = { t = 0.5, c = 0 }, road = { t = 2.0, c = 2.0 } }
 Bot.Cap = CAP
 
 local function pkey(x, y) return ("%d,%d"):format(math.floor(x * 8 + 0.5), math.floor(y * 8 + 0.5)) end
@@ -465,6 +465,22 @@ local function optimise(rules, mem, mats, opts, capBudget)
 	return mats, total
 end
 
+
+local function density(mem)
+	local nodes, n = {}, 0
+	for _, b in ipairs(mem) do
+		local a, c = pkey(b[1], b[2]), pkey(b[3], b[4])
+		if not nodes[a] then nodes[a] = true; n = n + 1 end
+		if not nodes[c] then nodes[c] = true; n = n + 1 end
+	end
+	return #mem / math.max(n, 1)
+end
+
+-- what the 51 recorded bridges say: the ones that lasted longest spent the most, were braced the densest, used little cable
+local function rank(lam, spent, cap, mem)
+	return 0.6 * math.min(lam or 0, 2) + 3 * math.min(spent / math.max(cap, 1), 1) + 1.5 * density(mem)
+end
+
 local function plan2(rules, card, budget)
 	local cap = math.floor(budget * (Bot.SpendPct / 100))
 	if budget >= 100000 then cap = math.min(cap, 60000) end
@@ -488,27 +504,25 @@ local function plan2(rules, card, budget)
 					local spent = totalCost(mem, mats)
 					if spent <= cap then
 						local lam = evaluate(mem, mats, opts)
-						if lam then cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1], s = s, h = h } end
+						if lam then cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1], s = s, h = h, score = rank(lam, spent, cap, mem) } end
 					end
 				end
 			end
 		end
 	end
 	if #cands == 0 then return nil end
-	table.sort(cands, function(a, b) return a.lam > b.lam end)
+	table.sort(cands, function(a, b) return a.score > b.score end)
 	local top = {}
 	for i = 1, math.min(8, #cands) do
 		local c = cands[i]
 		c.mats, c.cost = optimise(rules, c.mem, c.mats, opts, cap)
 		c.lam2 = evaluate(c.mem, c.mats, opts) or 0
+		c.score2 = rank(c.lam2, c.cost, cap, c.mem)
 		top[#top + 1] = c
 	end
-	table.sort(top, function(a, b)
-		if math.abs(a.lam2 - b.lam2) > 1e-6 then return a.lam2 > b.lam2 end
-		return a.cost < b.cost
-	end)
+	table.sort(top, function(a, b) return a.score2 > b.score2 end)
 	-- the game's own rules have the last word: realise every candidate, drop beams the game refuses, re-measure what is left, keep the strongest
-	local pick, pickLam
+	local pick, pickLam, pickScore
 	local shown = 0
 	for _, c in ipairs(top) do
 		for i, b in ipairs(c.mem) do b.mat = c.mats[i] end
@@ -517,7 +531,8 @@ local function plan2(rules, card, budget)
 			local beams = {}
 			for _, b in ipairs(placed) do beams[#beams + 1] = { b[1], b[2], b[3], b[4], b.mat } end
 			local lamP = Truss.strength(beams, opts, CAP) or 0
-			if not pick or lamP > pickLam then pick, pickLam = { c = c, d = d, placed = placed, refused = refused }, lamP end
+			local sc = rank(lamP, d:getSpent(), cap, placed)
+			if not pick or sc > pickScore then pick, pickLam, pickScore = { c = c, d = d, placed = placed, refused = refused }, lamP, sc end
 		elseif shown < 3 then
 			shown = shown + 1
 			local w = {}
@@ -660,6 +675,7 @@ function Bot.BuildNow()
 		log(("layout=%s twist=%s budget=%d materials=%s | %s | beams=%d spent=%d | road %d wood %d steel %d cable %d"):format(
 			Bot.Layout, Bot.Twist, budget, table.concat(card.materials, ","), Bot.Shape, #list, Bot.Spent,
 			counts.road or 0, counts.wood or 0, counts.steel or 0, counts.cable or 0))
+		Bot.builtRound = tostring(RoundState:GetAttribute("BuildFrom"))
 		local how = deliver(list, Bot.Spent)
 		local t0 = os.clock()
 		while reply == nil and os.clock() - t0 < 3 do task.wait(0.05) end
@@ -929,7 +945,27 @@ function Bot.Start()
 	return true
 end
 
+
+-- keep-alive: while Auto is on, make sure a bridge is on the server for the whole build phase (the game can overwrite it with an empty one)
+task.spawn(function()
+	while not Bot.dead do
+		task.wait(5)
+		if Design and RoundState and Bot.Auto and not Bot.Busy and not Bot.Tuning and RoundState:GetAttribute("Phase") == "Build" then
+			local left = (RoundState:GetAttribute("EndsAt") or 0) - workspace:GetServerTimeNow()
+			if left > 3 then
+				local id = tostring(RoundState:GetAttribute("BuildFrom"))
+				if Bot.builtRound ~= id then
+					Bot.BuildNow()
+				elseif Bot.last and Bot.last.list and #Bot.last.list > 0 and left < 40 then
+					pcall(function() Design:FireServer({ beams = Bot.last.list }) end)
+				end
+			end
+		end
+	end
+end)
+
 function Bot.Destroy()
+	Bot.dead = true
 	unhookClass()
 	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	conns = {}
