@@ -3,44 +3,57 @@
 --   beams : array of { x1, y1, x2, y2, mat }          (any consistent unit; the game's cells are fine)
 --   opts  : supports = function(x, y) -> bool         (nodes that are fixed: the cliff anchors)
 --           loadAt   = function(x, y) -> bool         (nodes a vehicle can press on: deck nodes)
--- A cable can only pull: a cable that ends up in compression is switched off and the case is solved again.
+-- A cable can only pull: a cable that ends up in compression is switched off and that load case is solved again.
+-- The stiffness matrix is factorised ONCE and reused for every load case (only a case that switches a cable off is refactorised).
 local Truss = {}
 
 local function key(x, y) return ("%d,%d"):format(math.floor(x * 8 + 0.5), math.floor(y * 8 + 0.5)) end
 
--- solve K u = p on the free degrees of freedom with Gaussian elimination (partial pivoting); returns nil if the structure is a mechanism
-local function solve(K, p, n)
-	local A = {}
-	for i = 1, n do
-		local row = {}
-		for j = 1, n do row[j] = K[i][j] end
-		row[n + 1] = p[i]
-		A[i] = row
-	end
+-- LU factorisation with partial pivoting (in place); returns a factor table or nil when singular
+local function factor(K, n)
+	local piv = {}
 	for c = 1, n do
-		local piv, best = c, math.abs(A[c][c])
+		local p, best = c, math.abs(K[c][c])
 		for r = c + 1, n do
-			local v = math.abs(A[r][c])
-			if v > best then piv, best = r, v end
+			local v = math.abs(K[r][c])
+			if v > best then p, best = r, v end
 		end
 		if best < 1e-9 then return nil end
-		A[c], A[piv] = A[piv], A[c]
-		local d = A[c][c]
+		piv[c] = p
+		if p ~= c then K[c], K[p] = K[p], K[c] end
+		local rc = K[c]
+		local d = rc[c]
 		for r = c + 1, n do
-			local f = A[r][c] / d
+			local rr = K[r]
+			local f = rr[c] / d
+			rr[c] = f
 			if f ~= 0 then
-				local ar, ac = A[r], A[c]
-				for j = c, n + 1 do ar[j] = ar[j] - f * ac[j] end
+				for j = c + 1, n do rr[j] = rr[j] - f * rc[j] end
 			end
 		end
 	end
-	local u = {}
-	for i = n, 1, -1 do
-		local s = A[i][n + 1]
-		for j = i + 1, n do s = s - A[i][j] * u[j] end
-		u[i] = s / A[i][i]
+	return { LU = K, piv = piv, n = n }
+end
+
+local function backsolve(F, b)
+	local n, LU, piv = F.n, F.LU, F.piv
+	local x = {}
+	for i = 1, n do x[i] = b[i] end
+	for c = 1, n do
+		local p = piv[c]
+		if p ~= c then x[c], x[p] = x[p], x[c] end
+		local xc = x[c]
+		if xc ~= 0 then
+			for r = c + 1, n do x[r] = x[r] - LU[r][c] * xc end
+		end
 	end
-	return u
+	for i = n, 1, -1 do
+		local row = LU[i]
+		local s = x[i]
+		for j = i + 1, n do s = s - row[j] * x[j] end
+		x[i] = s / row[i]
+	end
+	return x
 end
 
 function Truss.analyze(beams, opts)
@@ -61,16 +74,15 @@ function Truss.analyze(beams, opts)
 	end
 	local N = #order
 	-- degrees of freedom: 2 per node, fixed ones removed
-	local free, idx = {}, {}
+	local idx, D = {}, 0
 	for _, n in ipairs(order) do
 		local fixed = opts.supports and opts.supports(n.x, n.y)
 		n.fixed = fixed
 		if not fixed then
-			free[#free + 1] = { n.id, 1 }; idx[n.id * 2 - 1] = #free
-			free[#free + 1] = { n.id, 2 }; idx[n.id * 2] = #free
+			D = D + 1; idx[n.id * 2 - 1] = D
+			D = D + 1; idx[n.id * 2] = D
 		end
 	end
-	local D = #free
 	if D == 0 then return { ok = false } end
 	local loads = {}
 	for _, n in ipairs(order) do
@@ -78,51 +90,65 @@ function Truss.analyze(beams, opts)
 	end
 	if #loads == 0 then return { ok = false } end
 
-	local f, sg = {}, {}
-	for i = 1, #mem do f[i], sg[i] = 0, 1 end
-	local off = {}
-	for case = 1, #loads do
-		for i = 1, #mem do off[i] = false end
-		local forces
-		for _ = 1, 6 do
-			local K = {}
-			for i = 1, D do local r = {}; for j = 1, D do r[j] = 0 end; K[i] = r end
-			for i, m in ipairs(mem) do
-				if not off[i] then
-					local k = 1 / m.L
-					local c, s = m.cx, m.cy
-					local blocks = { { c * c, c * s }, { c * s, s * s } }
-					local ids = { m.a * 2 - 1, m.a * 2, m.b * 2 - 1, m.b * 2 }
-					local sgn = { 1, 1, -1, -1 }
-					local dirv = { c, s, c, s }
-					for p = 1, 4 do
-						local ip = idx[ids[p]]
-						if ip then
-							for q = 1, 4 do
-								local iq = idx[ids[q]]
-								if iq then K[ip][iq] = K[ip][iq] + k * dirv[p] * dirv[q] * sgn[p] * sgn[q] end
-							end
+	local function build(off)
+		local K = {}
+		for i = 1, D do local r = {}; for j = 1, D do r[j] = 0 end; K[i] = r end
+		for i, m in ipairs(mem) do
+			if not (off and off[i]) then
+				local k = 1 / m.L
+				local c, s = m.cx, m.cy
+				local ids = { m.a * 2 - 1, m.a * 2, m.b * 2 - 1, m.b * 2 }
+				local sgn = { 1, 1, -1, -1 }
+				local dirv = { c, s, c, s }
+				for p = 1, 4 do
+					local ip = idx[ids[p]]
+					if ip then
+						for q = 1, 4 do
+							local iq = idx[ids[q]]
+							if iq then K[ip][iq] = K[ip][iq] + k * dirv[p] * dirv[q] * sgn[p] * sgn[q] end
 						end
 					end
 				end
 			end
-			for i = 1, D do K[i][i] = K[i][i] + 1e-7 end -- tiny stabiliser: a dangling node (zero force) must not make the whole system singular
-			local P = {}
-			for i = 1, D do P[i] = 0 end
-			local ld = loads[case]
-			P[idx[ld.id * 2]] = -1
-			local u = solve(K, P, D)
-			if not u then return { ok = false, mechanism = true } end
-			forces = {}
-			local again = false
-			for i, m in ipairs(mem) do
-				local ua = (idx[m.a * 2 - 1] and u[idx[m.a * 2 - 1]] or 0) * m.cx + (idx[m.a * 2] and u[idx[m.a * 2]] or 0) * m.cy
-				local ub = (idx[m.b * 2 - 1] and u[idx[m.b * 2 - 1]] or 0) * m.cx + (idx[m.b * 2] and u[idx[m.b * 2]] or 0) * m.cy
-				local F = off[i] and 0 or (ub - ua) / m.L -- positive = tension
-				forces[i] = F
-				if m.mat == "cable" and not off[i] and F < -1e-9 then off[i] = true; again = true end
+		end
+		for i = 1, D do K[i][i] = K[i][i] + 1e-7 end -- tiny stabiliser: a dangling node (zero force) must not make the whole system singular
+		return factor(K, D)
+	end
+
+	local base = build(nil)
+	if not base then return { ok = false, mechanism = true } end
+
+	local function forcesOf(u, off)
+		local forces, again = {}, false
+		for i, m in ipairs(mem) do
+			local ua = (idx[m.a * 2 - 1] and u[idx[m.a * 2 - 1]] or 0) * m.cx + (idx[m.a * 2] and u[idx[m.a * 2]] or 0) * m.cy
+			local ub = (idx[m.b * 2 - 1] and u[idx[m.b * 2 - 1]] or 0) * m.cx + (idx[m.b * 2] and u[idx[m.b * 2]] or 0) * m.cy
+			local F = (off and off[i]) and 0 or (ub - ua) / m.L -- positive = tension
+			forces[i] = F
+			if m.mat == "cable" and not (off and off[i]) and F < -1e-9 then
+				off = off or {}
+				off[i] = true
+				again = true
 			end
-			if not again then break end
+		end
+		return forces, again, off
+	end
+
+	local f, sg = {}, {}
+	for i = 1, #mem do f[i], sg[i] = 0, 1 end
+	for case = 1, #loads do
+		local P = {}
+		for i = 1, D do P[i] = 0 end
+		P[idx[loads[case].id * 2]] = -1
+		local u = backsolve(base, P)
+		local forces, again, off = forcesOf(u, nil)
+		local guard = 0
+		while again and guard < 6 do
+			guard = guard + 1
+			local F2 = build(off)
+			if not F2 then return { ok = false, mechanism = true } end
+			u = backsolve(F2, P)
+			forces, again, off = forcesOf(u, off)
 		end
 		for i = 1, #mem do
 			local a = math.abs(forces[i])
@@ -132,12 +158,12 @@ function Truss.analyze(beams, opts)
 	return { ok = true, f = f, sign = sg, members = #mem, nodes = N }
 end
 
--- capacity per material and force direction, in "vehicle weights" (calibrated from recorded rounds; see tools/fit_capacity.py)
+-- capacity per material and force direction, in "vehicle weights" (provisional: see tools/fit_capacity.py)
 Truss.cap = {
-	wood = { t = 1.0, c = 0.6 },
+	wood = { t = 1.0, c = 1.0 },
 	steel = { t = 3.0, c = 2.5 },
-	cable = { t = 2.0, c = 0 },
-	road = { t = 1.5, c = 1.2 },
+	cable = { t = 1.7, c = 0 },
+	road = { t = 2.0, c = 2.0 },
 }
 
 -- load factor the bridge can take before its most stressed member reaches capacity (bigger = stronger); nil when it is a mechanism

@@ -253,7 +253,7 @@ end
 -- SOLVER PLANNER ---------------------------------------------------------------------------------------------------------
 -- Several truss topologies x panel widths x depths. Each is analysed with a real truss solver (src/truss.lua), then the budget is spent on the
 -- most stressed beams (a stronger material where its reach allows) while over-built beams are made cheaper. Capacities come from the recorded rounds.
-local CAP = { wood = { t = 1.0, c = 1.0 }, steel = { t = 3.0, c = 2.5 }, cable = { t = 0.5, c = 0 }, road = { t = 2.0, c = 2.0 } }
+local CAP = { wood = { t = 1.0, c = 1.0 }, steel = { t = 3.0, c = 2.5 }, cable = { t = 1.7, c = 0 }, road = { t = 2.0, c = 2.0 } }
 Bot.Cap = CAP
 
 local function pkey(x, y) return ("%d,%d"):format(math.floor(x * 8 + 0.5), math.floor(y * 8 + 0.5)) end
@@ -367,11 +367,55 @@ local function genXTruss(card, s, h, up)
 	return mem, { L = f.L, R = f.R, top = top, n = n, step = f.step, h = h }
 end
 
+
+-- cable stays from the tower anchors that stand above the deck (twist "cableTowers" and some layouts): tension only, cheap, long reach
+local function addStays(card, mem, info, k)
+	local m = card.map
+	local top, L, R = info.top, info.L, info.R
+	local tl, tr
+	for _, an in ipairs(m.anchors or {}) do
+		if an[2] > top + 0.01 then
+			if an[1] <= L + 0.01 then if not tl or an[2] > tl[2] then tl = an end
+			elseif an[1] >= R - 0.01 then if not tr or an[2] > tr[2] then tr = an end end
+		end
+	end
+	if not tl and not tr then return nil end
+	local out = {}
+	for i, b in ipairs(mem) do out[i] = b end
+	local seen = {}
+	for _, b in ipairs(mem) do seen[pkey(b[1], b[2]) .. "|" .. pkey(b[3], b[4])] = true end
+	local function add(x1, y1, x2, y2)
+		local a, c = pkey(x1, y1), pkey(x2, y2)
+		if seen[a .. "|" .. c] or seen[c .. "|" .. a] then return end
+		seen[a .. "|" .. c] = true
+		out[#out + 1] = { x1, y1, x2, y2, role = "stay", base = "cable" }
+	end
+	local n, step = info.n, info.step
+	local xs = {}
+	for i = 0, n do xs[i + 1] = L + i * step end
+	local function fan(t, from, to, dir)
+		local cnt = 0
+		for i = from, to, dir do
+			local dx, dy = xs[i] - t[1], top - t[2]
+			if dx * dx + dy * dy <= BuildConfig.reach.cable ^ 2 then
+				add(t[1], t[2], xs[i], top)
+				cnt = cnt + 1
+				if cnt >= k then break end
+			end
+		end
+	end
+	if tl then fan(tl, 2, n, 1) end
+	if tr then fan(tr, n, 2, -1) end
+	if #out == #mem then return nil end
+	return out
+end
+
 local function startMats(rules, mem)
 	local base = baseMaterial(rules)
 	local mats = {}
 	for i, b in ipairs(mem) do
 		if b.role == "deck" then mats[i] = "road"
+		elseif b.role == "stay" then mats[i] = "cable"
 		else
 			local m = Bot.over[sigOf(b)] or base
 			if not reachOK(m, memLen(b)) then
@@ -404,8 +448,8 @@ end
 local function reduce(mem, mats, opts, cap)
 	local m2, t2, protected = {}, {}, {}
 	for i, b in ipairs(mem) do m2[i] = b; t2[i] = mats[i] end
-	for _ = 1, 60 do
-		local lam, r = evaluate(m2, t2, opts)
+	local lam, r = evaluate(m2, t2, opts)
+	for _ = 1, 40 do
 		if not lam then return m2, t2 end
 		local total = totalCost(m2, t2)
 		local victim, vf = nil, math.huge
@@ -419,14 +463,31 @@ local function reduce(mem, mats, opts, cap)
 		if not victim then break end
 		local m3, t3 = {}, {}
 		for i, b in ipairs(m2) do if i ~= victim then m3[#m3 + 1] = b; t3[#t3 + 1] = t2[i] end end
-		local lam2 = evaluate(m3, t3, opts)
+		local lam2, r2 = evaluate(m3, t3, opts)
 		if lam2 and (vf < 0 or lam2 >= lam * 0.35) then
-			m2, t2 = m3, t3
+			m2, t2, lam, r = m3, t3, lam2, r2
 		else
 			protected[m2[victim]] = true
 		end
 	end
 	return m2, t2
+end
+
+
+-- the same design with every clearly tensioned beam turned into a cable (needs the beam to be within the cable's reach)
+local function cabled(rules, mem, mats, opts)
+	local lam, r = evaluate(mem, mats, opts)
+	if not lam then return nil end
+	local m2, changed = {}, 0
+	for i, b in ipairs(mem) do
+		m2[i] = mats[i]
+		if b.role ~= "deck" and b.role ~= "post" and b.role ~= "stay" and r.sign[i] > 0 and r.f[i] > 0.05 and mats[i] == "wood" and reachOK("cable", memLen(b)) then
+			m2[i] = "cable"
+			changed = changed + 1
+		end
+	end
+	if changed == 0 then return nil end
+	return m2
 end
 
 -- spend the budget where the stress is: upgrade the weakest non-deck beam, pay for it by making over-built beams cheaper
@@ -512,7 +573,7 @@ local function woodShare(mem, mats)
 end
 
 local function rank(lam, spent, cap, mem, mats)
-	return 0.6 * math.min(lam or 0, 2) + 3 * math.min(spent / math.max(cap, 1), 1) + 3 * density(mem) + 2 * woodShare(mem, mats)
+	return 2.5 * math.min(lam or 0, 2) + 3 * math.min(spent / math.max(cap, 1), 1) + 3 * density(mem) + 2 * woodShare(mem, mats)
 end
 
 local function plan2(rules, card, budget)
@@ -522,7 +583,7 @@ local function plan2(rules, card, budget)
 	if not f0 then return nil end
 	local opts = trussOpts(card, f0.top)
 	local cands = {}
-	local ss, hs = { 4, 3.5, 3, 2.5, 2, 1.5 }, { 2, 3, 4 }
+	local ss, hs = { 4, 3.5, 3, 2.5, 2, 1.5 }, { 1, 2, 3, 4 }
 	if Bot.Custom then
 		if Bot.ForcePanel > 0 then ss = { Bot.ForcePanel } end
 		if Bot.ForceDepth > 0 then hs = { Bot.ForceDepth } end
@@ -536,23 +597,47 @@ local function plan2(rules, card, budget)
 	}
 	for _, tp in ipairs(topos) do
 		for _, up in ipairs({ false, true }) do
+			local haveClean = false
+			for _, c in ipairs(cands) do if c.clean then haveClean = true; break end end
+			if up and haveClean then break end
 			for _, s in ipairs(ss) do
 				for _, h in ipairs(hs) do
-					local mem, info = tp[2](card, s, h, up)
-					if mem and #mem > 0 then
-						local mats = startMats(rules, mem)
-						mem, mats = reduce(mem, mats, opts, cap)
-						local spent = totalCost(mem, mats)
-						if spent <= cap then
-							local lam = evaluate(mem, mats, opts)
-							if lam then
-								-- would the game accept every beam? (blocked zones such as the boat, rocks, ceilings)
-								for i, b in ipairs(mem) do b.mat = mats[i] end
-								local _, refused, deckOK = realize(rules, mem)
-								for _, b in ipairs(mem) do b.mat = nil end
-								if deckOK then
-									cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1] .. (up and "^" or ""), s = s, h = h, up = up,
-										clean = refused == 0, score = rank(lam, spent, cap, mem, mats) - refused * 0.8 - (up and 1.2 or 0) }
+					local mem0, info = tp[2](card, s, h, up)
+					if mem0 and #mem0 > 0 then
+						local variants = { { mem0, "" } }
+						for _, k in ipairs({ 2, 4 }) do
+							local ms = addStays(card, mem0, info, k)
+							if ms then variants[#variants + 1] = { ms, "+stay" .. k } end
+						end
+						for _, v in ipairs(variants) do
+							Bot.tick = (Bot.tick or 0) + 1
+							if task and task.wait and Bot.tick % 6 == 0 then task.wait() end
+							local mem1 = v[1]
+							local mats1 = startMats(rules, mem1)
+							mem1, mats1 = reduce(mem1, mats1, opts, cap)
+							local forms = { { mem1, mats1, "" } }
+							-- cable version: every member that is clearly in tension becomes a cable (tension-only ties, like the recorded cable winners)
+							local cm = rules.allowed.cable and cabled(rules, mem1, mats1, opts)
+							if cm then
+								local mem2, mats2 = reduce(mem1, cm, opts, cap)
+								forms[#forms + 1] = { mem2, mats2, "+cable" }
+							end
+							for _, fm in ipairs(forms) do
+								local mem, mats = fm[1], fm[2]
+								local spent = totalCost(mem, mats)
+								if spent <= cap then
+									local lam = evaluate(mem, mats, opts)
+									if lam then
+										-- would the game accept every beam? (blocked zones such as the boat, rocks, ceilings)
+										for i, b in ipairs(mem) do b.mat = mats[i] end
+										local _, refused, deckOK = realize(rules, mem)
+										for _, b in ipairs(mem) do b.mat = nil end
+										if deckOK then
+											cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1] .. v[2] .. fm[3] .. (up and "^" or ""), s = s, h = h, up = up,
+												clean = refused == 0, stay = v[2] ~= "",
+												score = rank(lam, spent, cap, mem, mats) - refused * 0.8 - (up and 1.2 or 0) + (v[2] ~= "" and 0.8 or 0) }
+										end
+									end
 								end
 							end
 						end
@@ -572,7 +657,7 @@ local function plan2(rules, card, budget)
 		local c = cands[i]
 		c.mats, c.cost = optimise(rules, c.mem, c.mats, opts, cap)
 		c.lam2 = evaluate(c.mem, c.mats, opts) or 0
-		c.score2 = rank(c.lam2, c.cost, cap, c.mem, c.mats) - (c.up and 1.2 or 0)
+		c.score2 = rank(c.lam2, c.cost, cap, c.mem, c.mats) - (c.up and 1.2 or 0) + (c.stay and 0.8 or 0)
 		top[#top + 1] = c
 	end
 	table.sort(top, function(a, b) return a.score2 > b.score2 end)
@@ -586,7 +671,7 @@ local function plan2(rules, card, budget)
 			local beams = {}
 			for _, b in ipairs(placed) do beams[#beams + 1] = { b[1], b[2], b[3], b[4], b.mat } end
 			local lamP = Truss.strength(beams, opts, CAP) or 0
-			local sc = rank(lamP, d:getSpent(), cap, placed, nil) - refused * 0.8 - (c.up and 1.2 or 0)
+			local sc = rank(lamP, d:getSpent(), cap, placed, nil) - refused * 0.8 - (c.up and 1.2 or 0) + (c.stay and 0.8 or 0)
 			if not pick or sc > pickScore then pick, pickLam, pickScore = { c = c, d = d, placed = placed, refused = refused }, lamP, sc end
 		elseif shown < 3 then
 			shown = shown + 1
