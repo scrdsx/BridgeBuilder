@@ -184,8 +184,7 @@ local function plan(rules, card, budget)
 		if Bot.ForcePanel > 0 then panels, cpanels = { Bot.ForcePanel }, { Bot.ForcePanel } end
 		if Bot.ForceDepth > 0 then depths, cdepths = { Bot.ForceDepth }, { Bot.ForceDepth } end
 	end
-	local families = { "cable", "warren" }
-	if not rules.allowed.cable then families = { "warren" } end
+	local families = { "warren" }
 	if Bot.geom and Bot.geomKey == Bot.roundKey then -- tuning: keep the geometry so the learned beams still match
 		panels, depths, cpanels, cdepths = { Bot.geom.p }, { Bot.geom.h }, { Bot.geom.p }, { Bot.geom.h }
 		families = { Bot.geom.family }
@@ -508,17 +507,31 @@ local function plan2(rules, card, budget)
 		if math.abs(a.lam2 - b.lam2) > 1e-6 then return a.lam2 > b.lam2 end
 		return a.cost < b.cost
 	end)
-	-- the game's own rules have the last word: take the strongest design they accept in full
+	-- the game's own rules have the last word: realise every candidate, drop beams the game refuses, re-measure what is left, keep the strongest
+	local pick, pickLam
+	local shown = 0
 	for _, c in ipairs(top) do
 		for i, b in ipairs(c.mem) do b.mat = c.mats[i] end
-		local d, refused, deckOK, _, placed = realize(rules, c.mem)
-		if deckOK and refused == 0 and d:getSpent() <= budget then
-			log(("solver: %s s=%s h=%s  strength %.2f -> %.2f  cost %d  (%d candidates)"):format(c.name, tostring(c.s), tostring(c.h), c.lam, c.lam2, d:getSpent(), #cands))
-			Bot.Strength = c.lam2
-			return d, { mem = c.mem, info = c.info, p = c.s, h = c.h, refused = 0, family = c.name, placed = placed }
+		local d, refused, deckOK, why, placed = realize(rules, c.mem)
+		if deckOK and d:getSpent() <= budget then
+			local beams = {}
+			for _, b in ipairs(placed) do beams[#beams + 1] = { b[1], b[2], b[3], b[4], b.mat } end
+			local lamP = Truss.strength(beams, opts, CAP) or 0
+			if not pick or lamP > pickLam then pick, pickLam = { c = c, d = d, placed = placed, refused = refused }, lamP end
+		elseif shown < 3 then
+			shown = shown + 1
+			local w = {}
+			for k, n in pairs(why or {}) do w[#w + 1] = k .. " x" .. n end
+			log(("solver candidate %s s=%s h=%s refused by the game: deck %s, %s"):format(c.name, tostring(c.s), tostring(c.h), tostring(deckOK), table.concat(w, ", ")))
 		end
 	end
-	log("solver: no candidate was accepted by the game's rules - falling back")
+	if pick then
+		local c = pick.c
+		log(("solver: %s s=%s h=%s  strength %.2f -> %.2f  cost %d  (%d candidates, %d beams refused)"):format(c.name, tostring(c.s), tostring(c.h), c.lam, pickLam, pick.d:getSpent(), #cands, pick.refused))
+		Bot.Strength = pickLam
+		return pick.d, { mem = c.mem, info = c.info, p = c.s, h = c.h, refused = pick.refused, family = c.name, placed = pick.placed }
+	end
+	log("solver: no candidate had a complete deck under the game's rules - falling back")
 	return nil
 end
 
