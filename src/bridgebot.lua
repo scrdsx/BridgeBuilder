@@ -345,6 +345,28 @@ local function genPostW(card, s, h, chord, up)
 	return mem, { L = f.L, R = f.R, top = top, n = n, step = f.step, h = h }
 end
 
+
+-- counter-braced Pratt: both diagonals in every panel (densest triangulation; the data says dense bracing wins)
+local function genXTruss(card, s, h, up)
+	local f = frame(card, s, up)
+	if not f or not f.la or not f.ra then return nil end
+	local n, xs, top = f.n, f.xs, f.top
+	local bot = up and (top + h) or (top - h)
+	local mem, add = newMem()
+	for i = 1, n do add(xs[i], top, xs[i + 1], top, "deck") end
+	local B = {}
+	B[1] = { f.la[1], f.la[2] }
+	for i = 2, n do B[i] = { xs[i], bot } end
+	B[n + 1] = { f.ra[1], f.ra[2] }
+	for i = 2, n do add(xs[i], top, xs[i], bot, "post") end
+	for i = 1, n do add(B[i][1], B[i][2], B[i + 1][1], B[i + 1][2], "chord") end
+	for i = 1, n do
+		add(B[i][1], B[i][2], xs[i + 1], top, "diag")
+		add(B[i + 1][1], B[i + 1][2], xs[i], top, "diag")
+	end
+	return mem, { L = f.L, R = f.R, top = top, n = n, step = f.step, h = h }
+end
+
 local function startMats(rules, mem)
 	local base = baseMaterial(rules)
 	local mats = {}
@@ -477,9 +499,20 @@ local function density(mem)
 	return #mem / math.max(n, 1)
 end
 
--- what the 51 recorded bridges say: the ones that lasted longest spent the most, were braced the densest, used little cable
-local function rank(lam, spent, cap, mem)
-	return 0.6 * math.min(lam or 0, 2) + 3 * math.min(spent / math.max(cap, 1), 1) + 1.5 * density(mem)
+-- what the recorded bridges say (70 bridges, 14 rounds): the winners spent the whole budget, braced the densest (members per joint) and used the most wood
+local function woodShare(mem, mats)
+	local w, t = 0, 0
+	for i, b in ipairs(mem) do
+		local len = memLen(b)
+		t = t + len
+		local m = mats and mats[i] or b.mat
+		if m == "wood" then w = w + len end
+	end
+	return w / math.max(t, 1e-6)
+end
+
+local function rank(lam, spent, cap, mem, mats)
+	return 0.6 * math.min(lam or 0, 2) + 3 * math.min(spent / math.max(cap, 1), 1) + 3 * density(mem) + 2 * woodShare(mem, mats)
 end
 
 local function plan2(rules, card, budget)
@@ -489,7 +522,7 @@ local function plan2(rules, card, budget)
 	if not f0 then return nil end
 	local opts = trussOpts(card, f0.top)
 	local cands = {}
-	local ss, hs = { 4, 3.5, 3, 2.5, 2 }, { 2, 3, 4 }
+	local ss, hs = { 4, 3.5, 3, 2.5, 2, 1.5 }, { 2, 3, 4 }
 	if Bot.Custom then
 		if Bot.ForcePanel > 0 then ss = { Bot.ForcePanel } end
 		if Bot.ForceDepth > 0 then hs = { Bot.ForceDepth } end
@@ -499,6 +532,7 @@ local function plan2(rules, card, budget)
 		{ "postW", function(c, s2, h, up) return genPostW(c, s2, h, true, up) end },
 		{ "fan", function(c, s2, h, up) return genPostW(c, s2, h, false, up) end },
 		{ "warren", function(c, s2, h, up) return genMembers(c, s2, h, up) end },
+		{ "xtruss", function(c, s2, h, up) return genXTruss(c, s2, h, up) end },
 	}
 	for _, tp in ipairs(topos) do
 		for _, up in ipairs({ false, true }) do
@@ -518,7 +552,7 @@ local function plan2(rules, card, budget)
 								for _, b in ipairs(mem) do b.mat = nil end
 								if deckOK then
 									cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1] .. (up and "^" or ""), s = s, h = h, up = up,
-										clean = refused == 0, score = rank(lam, spent, cap, mem) - refused * 0.8 - (up and 1.2 or 0) }
+										clean = refused == 0, score = rank(lam, spent, cap, mem, mats) - refused * 0.8 - (up and 1.2 or 0) }
 								end
 							end
 						end
@@ -538,7 +572,7 @@ local function plan2(rules, card, budget)
 		local c = cands[i]
 		c.mats, c.cost = optimise(rules, c.mem, c.mats, opts, cap)
 		c.lam2 = evaluate(c.mem, c.mats, opts) or 0
-		c.score2 = rank(c.lam2, c.cost, cap, c.mem) - (c.up and 1.2 or 0)
+		c.score2 = rank(c.lam2, c.cost, cap, c.mem, c.mats) - (c.up and 1.2 or 0)
 		top[#top + 1] = c
 	end
 	table.sort(top, function(a, b) return a.score2 > b.score2 end)
@@ -552,7 +586,7 @@ local function plan2(rules, card, budget)
 			local beams = {}
 			for _, b in ipairs(placed) do beams[#beams + 1] = { b[1], b[2], b[3], b[4], b.mat } end
 			local lamP = Truss.strength(beams, opts, CAP) or 0
-			local sc = rank(lamP, d:getSpent(), cap, placed) - refused * 0.8 - (c.up and 1.2 or 0)
+			local sc = rank(lamP, d:getSpent(), cap, placed, nil) - refused * 0.8 - (c.up and 1.2 or 0)
 			if not pick or sc > pickScore then pick, pickLam, pickScore = { c = c, d = d, placed = placed, refused = refused }, lamP, sc end
 		elseif shown < 3 then
 			shown = shown + 1
