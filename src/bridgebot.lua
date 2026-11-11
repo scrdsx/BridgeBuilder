@@ -71,7 +71,7 @@ local function studs(dx, dy) return BuildConfig.cellSize * math.sqrt(dx * dx + d
 
 -- members: the abstract bridge (roles), realised with materials later --------------------------------------------------
 -- Warren truss under the deck: deck nodes every `step`, bottom nodes in the middle of every panel, diagonals in a W, bottom chord, braces from lower anchors.
-local function genMembers(card, p, h)
+local function genMembers(card, p, h, up)
 	local m = card.map
 	local cl = m.cliffs or { left = m.zone.minX, right = m.zone.maxX, top = m.deckY or 0 }
 	local L, R, top = cl.left, cl.right, cl.top
@@ -83,7 +83,7 @@ local function genMembers(card, p, h)
 	local xs = {}
 	for i = 0, n do xs[i + 1] = L + i * step end
 	local mem = {}
-	local bot = top - h
+	local bot = up and (top + h) or (top - h)
 	for i = 1, n do mem[#mem + 1] = { xs[i], top, xs[i + 1], top, role = "deck" } end
 	local mids = {}
 	for i = 1, n do
@@ -95,7 +95,7 @@ local function genMembers(card, p, h)
 	end
 	for i = 1, n - 1 do mem[#mem + 1] = { mids[i], bot, mids[i + 1], bot, role = "chord" } end
 	for _, an in ipairs(m.anchors or {}) do
-		if an[2] < top - 0.01 then
+		if an[2] < top - 0.01 and not up then
 			local mid = (an[1] <= L) and mids[1] or mids[n]
 			mem[#mem + 1] = { an[1], an[2], mid, bot, role = "brace" }
 		end
@@ -271,7 +271,7 @@ local function memLen(b) return math.sqrt((b[3] - b[1]) ^ 2 + (b[4] - b[2]) ^ 2)
 local function costOf(mat, lenCells) return math.round(BuildConfig.prices[mat] * BuildConfig.cellSize * lenCells) end
 local function reachOK(mat, lenCells) local r = BuildConfig.reach[mat]; return r ~= nil and lenCells <= r + 1e-6 end
 
-local function frame(card, s)
+local function frame(card, s, up)
 	local m = card.map
 	local cl = m.cliffs or { left = m.zone.minX, right = m.zone.maxX, top = m.deckY or 0 }
 	local L, R, top = cl.left, cl.right, cl.top
@@ -289,6 +289,7 @@ local function frame(card, s)
 			elseif an[1] >= R - 0.01 then if not ra or an[2] < ra[2] then ra = an end end
 		end
 	end
+	if up then la, ra = { L, top }, { R, top } end
 	return { L = L, R = R, top = top, n = n, step = step, xs = xs, la = la, ra = ra }
 end
 
@@ -305,11 +306,11 @@ local function newMem()
 end
 
 -- Pratt (as the round winner "Wren" built): posts under the deck nodes, bottom chord from anchor to anchor, diagonals leaning to the centre
-local function genPratt(card, s, h)
-	local f = frame(card, s)
+local function genPratt(card, s, h, up)
+	local f = frame(card, s, up)
 	if not f or not f.la or not f.ra then return nil end
 	local n, xs, top = f.n, f.xs, f.top
-	local bot = top - h
+	local bot = up and (top + h) or (top - h)
 	local mem, add = newMem()
 	for i = 1, n do add(xs[i], top, xs[i + 1], top, "deck") end
 	for i = 2, n do add(xs[i], top, xs[i], bot, "post") end
@@ -326,11 +327,11 @@ local function genPratt(card, s, h)
 end
 
 -- posts with a W of diagonals (the other winner shape): every post bottom reaches both neighbouring deck nodes
-local function genPostW(card, s, h, chord)
-	local f = frame(card, s)
+local function genPostW(card, s, h, chord, up)
+	local f = frame(card, s, up)
 	if not f then return nil end
 	local n, xs, top = f.n, f.xs, f.top
-	local bot = top - h
+	local bot = up and (top + h) or (top - h)
 	local mem, add = newMem()
 	for i = 1, n do add(xs[i], top, xs[i + 1], top, "deck") end
 	for i = 2, n do add(xs[i], top, xs[i], bot, "post") end
@@ -493,23 +494,43 @@ local function plan2(rules, card, budget)
 		if Bot.ForcePanel > 0 then ss = { Bot.ForcePanel } end
 		if Bot.ForceDepth > 0 then hs = { Bot.ForceDepth } end
 	end
-	local topos = { { "pratt", genPratt }, { "postW", genPostW }, { "fan", function(c, s, h) return genPostW(c, s, h, false) end }, { "warren", function(c, s, h) return genMembers(c, s, h) end } }
+	local topos = {
+		{ "pratt", function(c, s2, h, up) return genPratt(c, s2, h, up) end },
+		{ "postW", function(c, s2, h, up) return genPostW(c, s2, h, true, up) end },
+		{ "fan", function(c, s2, h, up) return genPostW(c, s2, h, false, up) end },
+		{ "warren", function(c, s2, h, up) return genMembers(c, s2, h, up) end },
+	}
 	for _, tp in ipairs(topos) do
-		for _, s in ipairs(ss) do
-			for _, h in ipairs(hs) do
-				local mem, info = tp[2](card, s, h)
-				if mem and #mem > 0 then
-					local mats = startMats(rules, mem)
-					mem, mats = reduce(mem, mats, opts, cap)
-					local spent = totalCost(mem, mats)
-					if spent <= cap then
-						local lam = evaluate(mem, mats, opts)
-						if lam then cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1], s = s, h = h, score = rank(lam, spent, cap, mem) } end
+		for _, up in ipairs({ false, true }) do
+			for _, s in ipairs(ss) do
+				for _, h in ipairs(hs) do
+					local mem, info = tp[2](card, s, h, up)
+					if mem and #mem > 0 then
+						local mats = startMats(rules, mem)
+						mem, mats = reduce(mem, mats, opts, cap)
+						local spent = totalCost(mem, mats)
+						if spent <= cap then
+							local lam = evaluate(mem, mats, opts)
+							if lam then
+								-- would the game accept every beam? (blocked zones such as the boat, rocks, ceilings)
+								for i, b in ipairs(mem) do b.mat = mats[i] end
+								local _, refused, deckOK = realize(rules, mem)
+								for _, b in ipairs(mem) do b.mat = nil end
+								if deckOK then
+									cands[#cands + 1] = { mem = mem, info = info, mats = mats, lam = lam, name = tp[1] .. (up and "^" or ""), s = s, h = h, up = up,
+										clean = refused == 0, score = rank(lam, spent, cap, mem) - refused * 0.8 - (up and 1.2 or 0) }
+								end
+							end
+						end
 					end
 				end
 			end
 		end
 	end
+	-- prefer designs the game accepts in full; only if there are none, work with partial ones
+	local clean = {}
+	for _, c in ipairs(cands) do if c.clean then clean[#clean + 1] = c end end
+	if #clean > 0 then cands = clean end
 	if #cands == 0 then return nil end
 	table.sort(cands, function(a, b) return a.score > b.score end)
 	local top = {}
@@ -517,7 +538,7 @@ local function plan2(rules, card, budget)
 		local c = cands[i]
 		c.mats, c.cost = optimise(rules, c.mem, c.mats, opts, cap)
 		c.lam2 = evaluate(c.mem, c.mats, opts) or 0
-		c.score2 = rank(c.lam2, c.cost, cap, c.mem)
+		c.score2 = rank(c.lam2, c.cost, cap, c.mem) - (c.up and 1.2 or 0)
 		top[#top + 1] = c
 	end
 	table.sort(top, function(a, b) return a.score2 > b.score2 end)
@@ -531,7 +552,7 @@ local function plan2(rules, card, budget)
 			local beams = {}
 			for _, b in ipairs(placed) do beams[#beams + 1] = { b[1], b[2], b[3], b[4], b.mat } end
 			local lamP = Truss.strength(beams, opts, CAP) or 0
-			local sc = rank(lamP, d:getSpent(), cap, placed)
+			local sc = rank(lamP, d:getSpent(), cap, placed) - refused * 0.8 - (c.up and 1.2 or 0)
 			if not pick or sc > pickScore then pick, pickLam, pickScore = { c = c, d = d, placed = placed, refused = refused }, lamP, sc end
 		elseif shown < 3 then
 			shown = shown + 1
